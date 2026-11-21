@@ -267,9 +267,9 @@ struct Ctx {
 }
 
 struct ParseOut {
-    keys: BucketSet<Key>,
-    recs: BucketSet<Rec>,
-    ck: BucketSet<Ck>,
+    keys: WcSet<Key, 4>,
+    recs: WcSet<Rec, 8>,
+    ck: WcSet<Ck, 8>,
 }
 
 fn parse_events_chunk(c: &Chunk, ctx: &Ctx, out: &mut ParseOut) {
@@ -439,6 +439,38 @@ impl Links {
     }
 }
 
+#[inline]
+fn uf_find(parent: &[AtomicU32], mut x: u32) -> u32 {
+    loop {
+        let p = parent[x as usize].load(Relaxed);
+        if p == x {
+            return x;
+        }
+        let gp = parent[p as usize].load(Relaxed);
+        if gp != p {
+            // path halving; parents only ever move to smaller indices, so this is safe to race
+            let _ = parent[x as usize].compare_exchange_weak(p, gp, Relaxed, Relaxed);
+        }
+        x = gp;
+    }
+}
+
+#[inline]
+fn uf_union(parent: &[AtomicU32], a: u32, b: u32) {
+    loop {
+        let ra = uf_find(parent, a);
+        let rb = uf_find(parent, b);
+        if ra == rb {
+            return;
+        }
+        let (hi, lo) = if ra > rb { (ra, rb) } else { (rb, ra) };
+        if parent[hi as usize].compare_exchange(hi, lo, AcqRel, Relaxed).is_ok() {
+            return;
+        }
+    }
+}
+
+#[allow(dead_code)]
 fn find(parent: &mut [u32], mut x: u32) -> u32 {
     unsafe {
         while *parent.get_unchecked(x as usize) != x {
@@ -552,20 +584,31 @@ fn build_links(lp: Vec<LinkParse>, nthreads: usize) -> Links {
     }
     drop(lp);
     lap("interned");
-    let parent: &'static mut [u32] = huge_zeroed(s_total);
-    for (i, p) in parent.iter_mut().enumerate() {
-        *p = i as u32;
-    }
-    for i in 0..npairs {
-        let ra = find(parent, pair_ids[2 * i]);
-        let rb = find(parent, pair_ids[2 * i + 1]);
-        if ra != rb {
-            if ra < rb {
-                parent[rb as usize] = ra
-            } else {
-                parent[ra as usize] = rb
+    // concurrent union-find: always link the larger root under the smaller (CAS), path halving
+    let parent: &'static [AtomicU32] = {
+        let m: &'static mut [u32] = huge_zeroed(s_total);
+        unsafe { std::mem::transmute::<&'static mut [u32], &'static [AtomicU32]>(m) }
+    };
+    {
+        let chunk = s_total.div_ceil(nthreads).max(1);
+        run_threads(nthreads, |t| {
+            for i in (t * chunk)..((t + 1) * chunk).min(s_total) {
+                parent[i].store(i as u32, Relaxed);
             }
-        }
+        });
+        let pair_ids: &[u32] = pair_ids;
+        let pchunk = npairs.div_ceil(nthreads * 8).max(1024);
+        let next = AtomicUsize::new(0);
+        run_threads(nthreads, |_| loop {
+            let c = next.fetch_add(1, Relaxed);
+            let lo = c * pchunk;
+            if lo >= npairs {
+                break;
+            }
+            for i in lo..(lo + pchunk).min(npairs) {
+                uf_union(parent, pair_ids[2 * i], pair_ids[2 * i + 1]);
+            }
+        });
     }
     lap("union-find");
     // roots + byte-smallest ID per component (parallel; parent is read-only now)
@@ -577,7 +620,6 @@ fn build_links(lp: Vec<LinkParse>, nthreads: usize) -> Links {
     };
     let chunk = s_total.div_ceil(nthreads * 8).max(1024);
     {
-        let parent: &[u32] = parent;
         let rp = SendPtr(root.as_mut_ptr());
         let (dref, used): (&[u64], &[u8]) = (dref, used);
         let next = AtomicUsize::new(0);
@@ -593,10 +635,7 @@ fn build_links(lp: Vec<LinkParse>, nthreads: usize) -> Links {
                     if used[i] == 0 {
                         continue;
                     }
-                    let mut r = i as u32;
-                    while parent[r as usize] != r {
-                        r = parent[r as usize];
-                    }
+                    let r = uf_find(parent, i as u32);
                     unsafe { *rp.0.add(i) = r };
                     let slot = &minid[r as usize];
                     let mut cur = slot.load(Relaxed);
@@ -743,12 +782,14 @@ fn main() {
         let mut best = f64::MAX;
         for it in 0..15 {
             let mut out = ParseOut {
-                keys: BucketSet::new(EB),
-                recs: BucketSet::new(UB),
-                ck: BucketSet::new(UB),
+                keys: WcSet::new(EB),
+                recs: WcSet::new(UB),
+                ck: WcSet::new(UB),
             };
             let t = Instant::now();
             parse_events_chunk(&c, &ctx, &mut out);
+            out.keys.finish();
+            out.recs.finish();
             let e = t.elapsed();
             let n: usize = (0..EB).map(|b| out.keys.len(b)).sum();
             best = best.min(e.as_nanos() as f64 / n as f64);
@@ -773,9 +814,9 @@ fn main() {
     let next = AtomicUsize::new(0);
     let pouts: Vec<ParseOut> = run_threads(nthreads, |_| {
         let mut out = ParseOut {
-            keys: BucketSet::new(EB),
-            recs: BucketSet::new(UB),
-            ck: BucketSet::new(UB),
+            keys: WcSet::new(EB),
+            recs: WcSet::new(UB),
+            ck: WcSet::new(UB),
         };
         loop {
             let i = next.fetch_add(1, Relaxed);
@@ -789,6 +830,9 @@ fn main() {
                 parse_clicks_chunk(c, &ctx, &mut out);
             }
         }
+        out.keys.finish();
+        out.recs.finish();
+        out.ck.finish();
         out
     });
     lap("P1 events+clicks parsed");
@@ -798,7 +842,7 @@ fn main() {
 
     // P2: dedup per event-id bucket: tombstone every valid copy except the earliest-ingested one
     let block_ptrs = arena().block_ptrs();
-    let rec_cap = (arena().block_bytes() / std::mem::size_of::<Rec>()) as u32;
+    let rec_cap = WcSet::<Rec, 8>::cap() as u32;
     let mark = |h: u32| {
         if h != u32::MAX {
             let p = block_ptrs[(h / rec_cap) as usize] as *mut Rec;
@@ -861,11 +905,11 @@ fn main() {
 
     // P3: drop losers, map users -> persons per user bucket; collect names of unlinked users
     let next = AtomicUsize::new(0);
-    type P3Out = (BucketSet<Ev>, BucketSet<Ck>, Vec<(usize, Vec<(u64, u64)>)>);
+    type P3Out = (WcSet<Ev, 4>, WcSet<Ck, 8>, Vec<(usize, Vec<(u64, u64)>)>);
     let order = lpt_order(|b| pouts.iter().map(|po| po.recs.len(b) + po.ck.len(b)).sum(), UB);
     let mouts: Vec<P3Out> = run_threads(nthreads, |_| {
-        let mut eo: BucketSet<Ev> = BucketSet::new(UB);
-        let mut co: BucketSet<Ck> = BucketSet::new(UB);
+        let mut eo: WcSet<Ev, 4> = WcSet::new(UB);
+        let mut co: WcSet<Ck, 8> = WcSet::new(UB);
         let mut names = Vec::new();
         let mut seen = SmallMap::new(0);
         loop {
@@ -909,6 +953,8 @@ fn main() {
             }
             names.push((b, nm));
         }
+        eo.finish();
+        co.finish();
         (eo, co, names)
     });
     let mut names_of: Vec<Vec<(u64, u64)>> = (0..UB).map(|_| Vec::new()).collect();

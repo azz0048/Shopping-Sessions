@@ -278,3 +278,157 @@ impl<T: Copy> BucketSet<T> {
         arena().release(&v);
     }
 }
+
+/// Bucket set with software write-combining: each bucket stages K elements (a whole number of
+/// cache lines) in a small cache-resident buffer and flushes them with non-temporal stores,
+/// avoiding read-for-ownership traffic on the scattered destination lines.
+/// Call `finish()` (on the writing thread) before reading.
+pub struct WcSet<T: Copy, const K: usize> {
+    hot: Vec<(*mut T, *mut T)>, // (cur, end) in block memory
+    cnt: Vec<u8>,
+    buf: Vec<Stage<T, K>>,
+    cold: Vec<Cold<T>>,
+}
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct Stage<T: Copy, const K: usize>([T; K]);
+unsafe impl<T: Copy, const K: usize> Send for WcSet<T, K> {}
+unsafe impl<T: Copy, const K: usize> Sync for WcSet<T, K> {}
+
+impl<T: Copy, const K: usize> WcSet<T, K> {
+    /// Elements per block (a multiple of K, so flush units never straddle blocks).
+    pub fn cap() -> usize {
+        arena().block_bytes() / std::mem::size_of::<T>() / K * K
+    }
+    pub fn new(n: usize) -> Self {
+        assert!((K * std::mem::size_of::<T>()) % 64 == 0);
+        WcSet {
+            hot: vec![(std::ptr::null_mut(), std::ptr::null_mut()); n],
+            cnt: vec![0; n],
+            buf: vec![Stage(unsafe { std::mem::zeroed() }); n],
+            cold: (0..n).map(|_| Cold { start: std::ptr::null_mut(), id: 0, blocks: Vec::new() }).collect(),
+        }
+    }
+    #[inline(always)]
+    pub fn push(&mut self, b: usize, v: T) {
+        unsafe {
+            let c = *self.cnt.get_unchecked(b) as usize;
+            *self.buf.get_unchecked_mut(b).0.get_unchecked_mut(c) = v;
+            if c + 1 == K {
+                self.flush(b);
+                *self.cnt.get_unchecked_mut(b) = 0;
+            } else {
+                *self.cnt.get_unchecked_mut(b) = (c + 1) as u8;
+            }
+        }
+    }
+    /// Push and return the element's arena handle (block id * cap + index).
+    #[inline(always)]
+    pub fn push_h(&mut self, b: usize, v: T) -> u32 {
+        unsafe {
+            let c = *self.cnt.get_unchecked(b) as usize;
+            if c == 0 {
+                let h = self.hot.get_unchecked(b);
+                if h.0 == h.1 {
+                    self.grow(b);
+                }
+            }
+            let cold = self.cold.get_unchecked(b);
+            let h = self.hot.get_unchecked(b);
+            let handle = cold.id * Self::cap() as u32 + h.0.offset_from(cold.start) as u32 + c as u32;
+            *self.buf.get_unchecked_mut(b).0.get_unchecked_mut(c) = v;
+            if c + 1 == K {
+                self.flush(b);
+                *self.cnt.get_unchecked_mut(b) = 0;
+            } else {
+                *self.cnt.get_unchecked_mut(b) = (c + 1) as u8;
+            }
+            handle
+        }
+    }
+    #[inline(always)]
+    unsafe fn flush(&mut self, b: usize) {
+        use std::arch::x86_64::*;
+        let h = self.hot.get_unchecked(b);
+        if h.0 == h.1 {
+            self.grow(b);
+        }
+        let h = self.hot.get_unchecked_mut(b);
+        let src = self.buf.get_unchecked(b).0.as_ptr() as *const u8;
+        let dst = h.0 as *mut u8;
+        let bytes = K * std::mem::size_of::<T>();
+        let mut o = 0;
+        while o < bytes {
+            _mm256_stream_si256(dst.add(o) as *mut __m256i, _mm256_load_si256(src.add(o) as *const __m256i));
+            o += 32;
+        }
+        h.0 = h.0.add(K);
+    }
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self, b: usize) {
+        let c = &mut self.cold[b];
+        let h = &mut self.hot[b];
+        if !c.start.is_null() {
+            let n = unsafe { h.0.offset_from(c.start) as usize };
+            c.blocks.push((c.start, n, c.id));
+        }
+        let (p, id) = arena().alloc();
+        let p = p as *mut T;
+        c.start = p;
+        c.id = id;
+        *h = (p, unsafe { p.add(Self::cap()) });
+    }
+    /// Write out partially filled stage buffers and fence the non-temporal stores.
+    pub fn finish(&mut self) {
+        for b in 0..self.hot.len() {
+            let n = self.cnt[b] as usize;
+            if n == 0 {
+                continue;
+            }
+            // a partial stage always fits: the block had room for a full K-unit at its first push
+            let h = self.hot[b];
+            if h.0 == h.1 {
+                self.grow(b);
+            }
+            let h = &mut self.hot[b];
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.buf[b].0.as_ptr(), h.0, n);
+                h.0 = h.0.add(n);
+            }
+            self.cnt[b] = 0;
+        }
+        unsafe { std::arch::x86_64::_mm_sfence() };
+    }
+    pub fn len(&self, b: usize) -> usize {
+        let c = &self.cold[b];
+        c.blocks.iter().map(|x| x.1).sum::<usize>()
+            + if c.start.is_null() { 0 } else { unsafe { self.hot[b].0.offset_from(c.start) as usize } }
+    }
+    #[inline(always)]
+    pub fn for_slices(&self, b: usize, mut f: impl FnMut(&[T])) {
+        let c = &self.cold[b];
+        for &(p, n, _) in &c.blocks {
+            f(unsafe { std::slice::from_raw_parts(p, n) });
+        }
+        if !c.start.is_null() {
+            let n = unsafe { self.hot[b].0.offset_from(c.start) as usize };
+            f(unsafe { std::slice::from_raw_parts(c.start, n) });
+        }
+    }
+    pub fn release_all(&mut self) {
+        let mut v: Vec<(usize, u32)> = Vec::new();
+        for (b, c) in self.cold.iter_mut().enumerate() {
+            for &(p, _, id) in &c.blocks {
+                v.push((p as usize, id));
+            }
+            if !c.start.is_null() {
+                v.push((c.start as usize, c.id));
+            }
+            c.blocks.clear();
+            c.start = std::ptr::null_mut();
+            self.hot[b] = (std::ptr::null_mut(), std::ptr::null_mut());
+        }
+        arena().release(&v);
+    }
+}
