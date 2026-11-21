@@ -497,7 +497,15 @@ fn lpt_order(sizes: impl Fn(usize) -> usize, n: usize) -> Vec<usize> {
 fn run_threads<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
     std::thread::scope(|sc| {
         let f = &f;
-        let hs: Vec<_> = (0..n).map(|t| sc.spawn(move || f(t))).collect();
+        let hs: Vec<_> = (0..n)
+            .map(|t| {
+                sc.spawn(move || {
+                    let r = f(t);
+                    arena_flush_tl();
+                    r
+                })
+            })
+            .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     })
 }
@@ -804,8 +812,7 @@ fn main() {
     let etotal: usize = ev_files.iter().map(|d| d.len()).sum();
     let ctotal: usize = ck_files.iter().map(|d| d.len()).sum();
     let target = ((etotal + ctotal) / (nthreads * 24)).clamp(1 << 18, 16 << 20);
-    let total_in = etotal + ctotal;
-    let block = (total_in / nthreads / 8192).clamp(4096, 65536).next_power_of_two().min(65536);
+    let block: usize = std::env::var("SS_BLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(8192);
     init_arena(1 << 30, block);
     let mut chunks = Vec::new();
     make_chunks(&ev_files, 0, target, &mut chunks);

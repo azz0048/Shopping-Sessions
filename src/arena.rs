@@ -17,6 +17,10 @@ struct State {
 
 static mut ARENA: Option<Arena> = None;
 
+thread_local! {
+    static TL_BLOCKS: std::cell::RefCell<Vec<(usize, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 #[allow(static_mut_refs)]
 pub fn arena() -> &'static Arena {
     unsafe { ARENA.as_ref().unwrap() }
@@ -52,22 +56,45 @@ impl Arena {
     pub fn block_bytes(&self) -> usize {
         self.block
     }
-    /// Returns (address, block id).
+    /// Returns (address, block id). Blocks come from a small per-thread cache that is refilled
+    /// in batches (freed blocks first, then fresh ones), so threads rarely touch the lock.
     pub fn alloc(&self) -> (*mut u8, u32) {
-        let mut st = self.state.lock().unwrap();
-        if let Some((p, id)) = st.free.pop() {
-            return (p as *mut u8, id);
-        }
-        if st.cur + self.block > st.end {
-            let r = map_region(self.region);
-            st.cur = r;
-            st.end = r + self.region;
-        }
-        let p = st.cur;
-        st.cur += self.block;
-        let id = st.ptrs.len() as u32;
-        st.ptrs.push(p);
-        (p as *mut u8, id)
+        TL_BLOCKS.with(|c| {
+            let mut c = c.borrow_mut();
+            if let Some((p, id)) = c.pop() {
+                return (p as *mut u8, id);
+            }
+            let mut st = self.state.lock().unwrap();
+            for _ in 0..32 {
+                if let Some(x) = st.free.pop() {
+                    c.push(x);
+                    continue;
+                }
+                if st.cur + self.block > st.end {
+                    let r = map_region(self.region);
+                    st.cur = r;
+                    st.end = r + self.region;
+                }
+                let p = st.cur;
+                st.cur += self.block;
+                let id = st.ptrs.len() as u32;
+                st.ptrs.push(p);
+                c.push((p, id));
+            }
+            // hand out the lowest address first so a thread's blocks stay contiguous
+            c.reverse();
+            let (p, id) = c.pop().unwrap();
+            (p as *mut u8, id)
+        })
+    }
+    /// Return this thread's cached, unused blocks to the shared free list.
+    pub fn flush_thread_cache(&self) {
+        TL_BLOCKS.with(|c| {
+            let mut c = c.borrow_mut();
+            if !c.is_empty() {
+                self.state.lock().unwrap().free.extend(c.drain(..));
+            }
+        });
     }
     pub fn release(&self, blocks: &[(usize, u32)]) {
         self.state.lock().unwrap().free.extend_from_slice(blocks);
@@ -430,5 +457,15 @@ impl<T: Copy, const K: usize> WcSet<T, K> {
             self.hot[b] = (std::ptr::null_mut(), std::ptr::null_mut());
         }
         arena().release(&v);
+    }
+}
+
+/// Return the calling thread's cached blocks to the shared pool (no-op before init).
+#[allow(static_mut_refs)]
+pub fn arena_flush_tl() {
+    unsafe {
+        if let Some(a) = ARENA.as_ref() {
+            a.flush_thread_cache();
+        }
     }
 }
