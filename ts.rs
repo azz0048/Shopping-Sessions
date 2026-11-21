@@ -1,0 +1,218 @@
+#![allow(dead_code)]
+// ---------- timestamps ----------
+#[inline(always)]
+pub fn dg(c: u8) -> Option<i64> {
+    if c.is_ascii_digit() { Some((c - b'0') as i64) } else { None }
+}
+#[inline(always)]
+pub fn d2(s: &[u8], i: usize) -> Option<i64> {
+    Some(dg(s[i])? * 10 + dg(s[i + 1])?)
+}
+#[inline(always)]
+pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+#[inline(always)]
+pub fn parse_dt(s: &[u8]) -> Option<i64> {
+    // s.len() >= 19, checks YYYY-MM-DDTHH:MM:SS
+    let y = d2(s, 0)? * 100 + d2(s, 2)?;
+    if s[4] != b'-' || s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+        return None;
+    }
+    let mo = d2(s, 5)?;
+    let d = d2(s, 8)?;
+    let h = d2(s, 11)?;
+    let mi = d2(s, 14)?;
+    let se = d2(s, 17)?;
+    if !(1..=12).contains(&mo) || d < 1 || h > 23 || mi > 59 || se > 59 {
+        return None;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let dim = match mo {
+        2 => if leap { 29 } else { 28 },
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if d > dim {
+        return None;
+    }
+    Some((((days_from_civil(y, mo, d) * 24 + h) * 60 + mi) * 60 + se) * 1000)
+}
+pub fn parse_ts(s: &[u8]) -> Option<i64> {
+    let n = s.len();
+    if n == 0 {
+        return None;
+    }
+    if n >= 5 && s[4] == b'-' {
+        if n == 20 {
+            if s[19] != b'Z' {
+                return None;
+            }
+            return parse_dt(s);
+        } else if n == 25 {
+            let sign = match s[19] {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            let oh = d2(s, 20)?;
+            let om = d2(s, 23)?;
+            if s[22] != b':' || oh > 23 || om > 59 {
+                return None;
+            }
+            return Some(parse_dt(s)? - sign * (oh * 60 + om) * 60_000);
+        }
+        return None;
+    }
+    // F3: digits only
+    let mut i = 0;
+    while i < n && s[i] == b'0' {
+        i += 1;
+    }
+    let mut v: u64 = 0;
+    let sig = n - i;
+    for &c in &s[i..] {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        if sig <= 19 {
+            v = v * 10 + (c - b'0') as u64;
+        }
+    }
+    if sig > 19 || v > i64::MAX as u64 {
+        return Some(i64::MAX); // valid form, outside any window
+    }
+    Some(v as i64)
+}
+#[inline(always)]
+pub fn parse_price(s: &[u8]) -> Option<u32> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut i = 0;
+    while i < s.len() && s[i] == b'0' {
+        i += 1;
+    }
+    let mut v: u64 = 0;
+    for &c in &s[i..] {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        v = v * 10 + (c - b'0') as u64;
+        if v > 10_000_000 {
+            // keep scanning for non-digits is unnecessary: any non-digit or too big -> invalid
+            return None;
+        }
+    }
+    if v >= 1 { Some(v as u32) } else { None }
+}
+
+
+// ---------- SWAR fast path for "YYYY-MM-DDTHH:MM:SS" (first 19 bytes; caller guarantees len >= 20) ----------
+const DIG_A: u64 = 0x00FF_FF00_FFFF_FFFF; // bytes 0-3,5,6 digits (little endian: byte i at bits 8i)
+const DIG_B: u64 = 0xFFFF_00FF_FF00_FFFF; // bytes 8,9,11,12,14,15
+const SEP_A_MASK: u64 = 0xFF00_00FF_0000_0000; // bytes 4 and 7
+const SEP_A: u64 = ((b'-' as u64) << 32) | ((b'-' as u64) << 56);
+const SEP_B_MASK: u64 = 0x0000_FF00_00FF_0000; // bytes 10, 13 (positions 2,5 in b)
+const SEP_B: u64 = ((b'T' as u64) << 16) | ((b':' as u64) << 40);
+
+#[inline(always)]
+fn bad_digits(t: u64, mask: u64) -> bool {
+    ((t.wrapping_add(0x7676_7676_7676_7676) | t) & 0x8080_8080_8080_8080 & (mask & 0x8080_8080_8080_8080)) != 0
+}
+#[inline(always)]
+fn byte(t: u64, i: u32) -> i64 {
+    ((t >> (8 * i)) & 0xFF) as i64
+}
+
+/// Milliseconds for "YYYY-MM-DDTHH:MM:SS" at the start of s (s.len() >= 20). None if invalid.
+#[inline(always)]
+pub fn parse_dt_fast(s: &[u8]) -> Option<i64> {
+    let a = u64::from_le_bytes(s[0..8].try_into().unwrap());
+    let b = u64::from_le_bytes(s[8..16].try_into().unwrap());
+    let c = u32::from_le_bytes(s[16..20].try_into().unwrap()) as u64;
+    if (a & SEP_A_MASK) != SEP_A || (b & SEP_B_MASK) != SEP_B || (c & 0xFF) != b':' as u64 {
+        return None;
+    }
+    let ta = a ^ 0x3030_3030_3030_3030;
+    let tb = b ^ 0x3030_3030_3030_3030;
+    let tc = c ^ 0x3030_3030;
+    if bad_digits(ta, DIG_A) || bad_digits(tb, DIG_B) || bad_digits(tc, 0x00FF_FF00) {
+        return None;
+    }
+    let y = byte(ta, 0) * 1000 + byte(ta, 1) * 100 + byte(ta, 2) * 10 + byte(ta, 3);
+    let mo = byte(ta, 5) * 10 + byte(ta, 6);
+    let d = byte(tb, 0) * 10 + byte(tb, 1);
+    let h = byte(tb, 3) * 10 + byte(tb, 4);
+    let mi = byte(tb, 6) * 10 + byte(tb, 7);
+    let se = byte(tc, 1) * 10 + byte(tc, 2);
+    if mo.wrapping_sub(1) as u64 > 11 || d < 1 || h > 23 || mi > 59 || se > 59 {
+        return None;
+    }
+    if d > 28 {
+        let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+        let dim = match mo {
+            2 => if leap { 29 } else { 28 },
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        if d > dim {
+            return None;
+        }
+    }
+    Some((((days_from_civil(y, mo, d) * 24 + h) * 60 + mi) * 60 + se) * 1000)
+}
+
+#[inline(always)]
+pub fn parse_ts_fast(s: &[u8]) -> Option<i64> {
+    let n = s.len();
+    if n == 20 {
+        if s[19] == b'Z' {
+            return parse_dt_fast(s);
+        }
+    } else if n == 25 {
+        let sign = match s[19] {
+            b'+' => 1,
+            b'-' => -1,
+            _ => return parse_ts_slow_f3(s),
+        };
+        let oh = d2(s, 20)?;
+        let om = d2(s, 23)?;
+        if s[22] != b':' || oh > 23 || om > 59 {
+            return None;
+        }
+        return Some(parse_dt_fast(s)? - sign * (oh * 60 + om) * 60_000);
+    }
+    parse_ts_slow_f3(s)
+}
+
+/// F3 (digits only) or invalid.
+#[inline(always)]
+fn parse_ts_slow_f3(s: &[u8]) -> Option<i64> {
+    let n = s.len();
+    if n == 0 {
+        return None;
+    }
+    let mut i = 0;
+    while i < n && s[i] == b'0' {
+        i += 1;
+    }
+    let sig = n - i;
+    let mut v: u64 = 0;
+    for &c in &s[i..] {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        v = v.wrapping_mul(10).wrapping_add((c - b'0') as u64);
+    }
+    if sig > 19 || v > i64::MAX as u64 {
+        return Some(i64::MAX);
+    }
+    Some(v as i64)
+}
