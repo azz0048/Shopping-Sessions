@@ -267,9 +267,9 @@ struct Ctx {
 }
 
 struct ParseOut {
-    keys: Vec<Bucket<Key>>,
-    recs: Vec<Bucket<Rec>>,
-    ck: Vec<Bucket<Ck>>,
+    keys: BucketSet<Key>,
+    recs: BucketSet<Rec>,
+    ck: BucketSet<Ck>,
 }
 
 fn parse_events_chunk(c: &Chunk, ctx: &Ctx, out: &mut ParseOut) {
@@ -331,9 +331,9 @@ fn parse_events_chunk(c: &Chunk, ctx: &Ctx, out: &mut ParseOut) {
                 _ => break 'v u32::MAX,
             };
             let uh = hash1(user);
-            out.recs[ub_of(uh)].push_h(Rec { user: uh, uref: pack(user), ts: (ts - ws) as u32, pc })
+            out.recs.push_h(ub_of(uh), Rec { user: uh, uref: pack(user), ts: (ts - ws) as u32, pc })
         };
-        out.keys[eb_of(h1)].push(Key { hk, ingest: ing_rel, handle });
+        out.keys.push(eb_of(h1), Key { hk, ingest: ing_rel, handle });
     }
 }
 
@@ -361,7 +361,7 @@ fn parse_clicks_chunk(c: &Chunk, ctx: &Ctx, out: &mut ParseOut) {
             None => continue,
         };
         let u = hash1(f[1]);
-        out.ck[ub_of(u)].push(Ck { person: u, cid: pack(f[0]), ts: (ts - lo) as u32, camp });
+        out.ck.push(ub_of(u), Ck { person: u, cid: pack(f[0]), ts: (ts - lo) as u32, camp });
     }
 }
 
@@ -743,18 +743,18 @@ fn main() {
         let mut best = f64::MAX;
         for it in 0..15 {
             let mut out = ParseOut {
-                keys: (0..EB).map(|_| Bucket::new()).collect(),
-                recs: (0..UB).map(|_| Bucket::new()).collect(),
-                ck: (0..UB).map(|_| Bucket::new()).collect(),
+                keys: BucketSet::new(EB),
+                recs: BucketSet::new(UB),
+                ck: BucketSet::new(UB),
             };
             let t = Instant::now();
             parse_events_chunk(&c, &ctx, &mut out);
             let e = t.elapsed();
-            let n: usize = out.keys.iter().map(|k| k.len()).sum();
+            let n: usize = (0..EB).map(|b| out.keys.len(b)).sum();
             best = best.min(e.as_nanos() as f64 / n as f64);
             if it == 14 { eprintln!("min {:.1} ns/line over 15 iters ({n} events)", best); }
-            for k in out.keys.iter_mut() { k.release(); }
-            for k in out.recs.iter_mut() { k.release(); }
+            out.keys.release_all();
+            out.recs.release_all();
         }
         std::process::exit(0);
     }
@@ -773,9 +773,9 @@ fn main() {
     let next = AtomicUsize::new(0);
     let pouts: Vec<ParseOut> = run_threads(nthreads, |_| {
         let mut out = ParseOut {
-            keys: (0..EB).map(|_| Bucket::new()).collect(),
-            recs: (0..UB).map(|_| Bucket::new()).collect(),
-            ck: (0..UB).map(|_| Bucket::new()).collect(),
+            keys: BucketSet::new(EB),
+            recs: BucketSet::new(UB),
+            ck: BucketSet::new(UB),
         };
         loop {
             let i = next.fetch_add(1, Relaxed);
@@ -806,7 +806,7 @@ fn main() {
         }
     };
     let next = AtomicUsize::new(0);
-    let order = lpt_order(|b| pouts.iter().map(|po| po.keys[b].len()).sum(), EB);
+    let order = lpt_order(|b| pouts.iter().map(|po| po.keys.len(b)).sum(), EB);
     run_threads(nthreads, |_| {
         let mut keys: Vec<Key> = Vec::new();
         let mut slots: Vec<u32> = Vec::new();
@@ -818,7 +818,7 @@ fn main() {
             let b = order[i];
             keys.clear();
             for po in pouts.iter() {
-                po.keys[b].for_slices(|x| keys.extend_from_slice(x));
+                po.keys.for_slices(b, |x| keys.extend_from_slice(x));
             }
             let n = keys.len();
             if n == 0 {
@@ -855,19 +855,17 @@ fn main() {
     lap("P2 dedup");
     let mut pouts = pouts;
     for po in pouts.iter_mut() {
-        for k in po.keys.iter_mut() {
-            k.release();
-        }
+        po.keys.release_all();
     }
     let pouts = pouts;
 
     // P3: drop losers, map users -> persons per user bucket; collect names of unlinked users
     let next = AtomicUsize::new(0);
-    type P3Out = (Vec<Bucket<Ev>>, Vec<Bucket<Ck>>, Vec<(usize, Vec<(u64, u64)>)>);
-    let order = lpt_order(|b| pouts.iter().map(|po| po.recs[b].len() + po.ck[b].len()).sum(), UB);
+    type P3Out = (BucketSet<Ev>, BucketSet<Ck>, Vec<(usize, Vec<(u64, u64)>)>);
+    let order = lpt_order(|b| pouts.iter().map(|po| po.recs.len(b) + po.ck.len(b)).sum(), UB);
     let mouts: Vec<P3Out> = run_threads(nthreads, |_| {
-        let mut eo: Vec<Bucket<Ev>> = (0..UB).map(|_| Bucket::new()).collect();
-        let mut co: Vec<Bucket<Ck>> = (0..UB).map(|_| Bucket::new()).collect();
+        let mut eo: BucketSet<Ev> = BucketSet::new(UB);
+        let mut co: BucketSet<Ck> = BucketSet::new(UB);
         let mut names = Vec::new();
         let mut seen = SmallMap::new(0);
         loop {
@@ -879,7 +877,7 @@ fn main() {
             let mut nm: Vec<(u64, u64)> = Vec::new();
             seen.reset(64);
             for po in pouts.iter() {
-                po.recs[b].for_slices(|x| {
+                po.recs.for_slices(b, |x| {
                     for r in x {
                         if r.ts == u32::MAX {
                             continue;
@@ -894,10 +892,10 @@ fn main() {
                                 r.user
                             }
                         };
-                        eo[ub_of(p)].push(Ev { person: p, ts: r.ts, pc: r.pc });
+                        eo.push(ub_of(p), Ev { person: p, ts: r.ts, pc: r.pc });
                     }
                 });
-                po.ck[b].for_slices(|x| {
+                po.ck.for_slices(b, |x| {
                     for c in x {
                         let p = match links.lookup(b, c.person) {
                             Some((p, _)) => p,
@@ -905,7 +903,7 @@ fn main() {
                         };
                         let mut c2 = *c;
                         c2.person = p;
-                        co[ub_of(p)].push(c2);
+                        co.push(ub_of(p), c2);
                     }
                 });
             }
@@ -924,8 +922,8 @@ fn main() {
     lap("P3 person mapping");
     let mut pouts = pouts;
     for po in pouts.iter_mut() {
-        po.recs.iter_mut().for_each(|x| x.release());
-        po.ck.iter_mut().for_each(|x| x.release());
+        po.recs.release_all();
+        po.ck.release_all();
     }
 
     // P4: person buckets
@@ -935,9 +933,9 @@ fn main() {
     std::fs::create_dir_all(out_dir.join("user_daily")).unwrap();
     std::fs::create_dir_all(out_dir.join("campaign_daily")).unwrap();
     let next = AtomicUsize::new(0);
-    let order = lpt_order(|b| mouts.iter().map(|d| d.0[b].len() + d.1[b].len() / 2).sum(), UB);
+    let order = lpt_order(|b| mouts.iter().map(|d| d.0.len(b) + d.1.len(b) / 2).sum(), UB);
     if verbose {
-        let sz: Vec<usize> = order.iter().map(|&b| mouts.iter().map(|d| d.0[b].len()).sum()).collect();
+        let sz: Vec<usize> = order.iter().map(|&b| mouts.iter().map(|d| d.0.len(b)).sum()).collect();
         eprintln!("      P4 buckets: max {} {} {} median {} min {}", sz[0], sz[1], sz[2], sz[UB / 2], sz[UB - 1]);
     }
     let works: Vec<PersonWork> = run_threads(nthreads, |t| {
@@ -953,9 +951,10 @@ fn main() {
         };
         let mut sorted: Vec<Ev> = Vec::new();
         let mut pname: Vec<u64> = Vec::new();
+        let mut sort_tmp: Vec<Ev> = Vec::new();
         let mut csorted: Vec<Ck> = Vec::new();
-        let maxn = (0..UB).map(|b| mouts.iter().map(|d| d.0[b].len()).sum::<usize>()).max().unwrap_or(0);
-        let maxc = (0..UB).map(|b| mouts.iter().map(|d| d.1[b].len()).sum::<usize>()).max().unwrap_or(0);
+        let maxn = (0..UB).map(|b| mouts.iter().map(|d| d.0.len(b)).sum::<usize>()).max().unwrap_or(0);
+        let maxc = (0..UB).map(|b| mouts.iter().map(|d| d.1.len(b)).sum::<usize>()).max().unwrap_or(0);
         sorted.reserve(maxn);
         csorted.reserve(maxc);
         w.rows.reserve(maxn * UB / nthreads / 6);
@@ -975,7 +974,7 @@ fn main() {
             }
             let b = order[i];
             let tb = Instant::now();
-            let n: usize = mouts.iter().map(|d| d.0[b].len()).sum::<usize>();
+            let n: usize = mouts.iter().map(|d| d.0.len(b)).sum::<usize>();
             if n == 0 {
                 continue;
             }
@@ -984,7 +983,7 @@ fn main() {
             pcount.clear();
             pid.clear();
             for d in mouts.iter() {
-                d.0[b].for_slices(|x| {
+                d.0.for_slices(b, |x| {
                     for e in x {
                         let np = pcount.len() as u32;
                         let id = pmap.insert_grow(e.person, np, np as usize);
@@ -1011,7 +1010,7 @@ fn main() {
             pfill.extend_from_slice(&pstart[..np]);
             let mut i = 0;
             for d in mouts.iter() {
-                d.0[b].for_slices(|x| {
+                d.0.for_slices(b, |x| {
                     for e in x {
                         let id = pid[i] as usize;
                         i += 1;
@@ -1025,7 +1024,7 @@ fn main() {
             ccount.clear();
             ccount.resize(np, 0);
             for d in mouts.iter() {
-                d.1[b].for_slices(|x| {
+                d.1.for_slices(b, |x| {
                     for c in x {
                         let id = pmap.get(c.person).unwrap_or(u32::MAX);
                         cpid.push(id);
@@ -1049,7 +1048,7 @@ fn main() {
             pfill.extend_from_slice(&cstart[..np]);
             let mut i = 0;
             for d in mouts.iter() {
-                d.1[b].for_slices(|x| {
+                d.1.for_slices(b, |x| {
                     for c in x {
                         let id = cpid[i];
                         i += 1;
@@ -1083,7 +1082,7 @@ fn main() {
             for id in 0..np {
                 let ev = &mut sorted[pstart[id] as usize..pstart[id + 1] as usize];
                 if ev.len() > 1 {
-                    ev.sort_unstable_by_key(|e| e.ts);
+                    sort_events(ev, &mut sort_tmp);
                 }
                 let cs = &mut csorted[cstart[id] as usize..cstart[id + 1] as usize];
                 if cs.len() > 1 {

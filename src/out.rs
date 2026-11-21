@@ -183,3 +183,47 @@ pub fn write_campaign_daily(path: &Path, rows: &[CRow]) {
     ];
     pq::write(path, &cols, rows.len()).expect("write campaign_daily");
 }
+
+/// Sort events by ts: LSD radix (3 x 11 bits) for large slices, comparison sort otherwise.
+pub fn sort_events(ev: &mut [Ev], tmp: &mut Vec<Ev>) {
+    let n = ev.len();
+    if n < 2048 {
+        ev.sort_unstable_by_key(|e| e.ts);
+        return;
+    }
+    tmp.clear();
+    tmp.reserve(n);
+    unsafe { tmp.set_len(n) };
+    let mut cnt = [[0u32; 2048]; 3];
+    for e in ev.iter() {
+        let t = e.ts;
+        cnt[0][(t & 2047) as usize] += 1;
+        cnt[1][((t >> 11) & 2047) as usize] += 1;
+        cnt[2][(t >> 22) as usize & 2047] += 1;
+    }
+    for c in cnt.iter_mut() {
+        let mut acc = 0u32;
+        for x in c.iter_mut() {
+            let v = *x;
+            *x = acc;
+            acc += v;
+        }
+    }
+    // pass 0: ev -> tmp, pass 1: tmp -> ev, pass 2: ev -> tmp, then copy back
+    for e in ev.iter() {
+        let d = &mut cnt[0][(e.ts & 2047) as usize];
+        tmp[*d as usize] = *e;
+        *d += 1;
+    }
+    for e in tmp.iter() {
+        let d = &mut cnt[1][((e.ts >> 11) & 2047) as usize];
+        ev[*d as usize] = *e;
+        *d += 1;
+    }
+    for e in ev.iter() {
+        let d = &mut cnt[2][(e.ts >> 22) as usize & 2047];
+        tmp[*d as usize] = *e;
+        *d += 1;
+    }
+    ev.copy_from_slice(tmp);
+}

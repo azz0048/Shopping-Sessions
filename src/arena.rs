@@ -177,3 +177,104 @@ pub fn huge_zeroed<T: Copy>(n: usize) -> &'static mut [T] {
     let p = map_region(bytes);
     unsafe { std::slice::from_raw_parts_mut(p as *mut T, n) }
 }
+
+/// A set of buckets with the hot write pointers packed densely (16 bytes per bucket),
+/// so scattering into thousands of buckets keeps the headers cache-resident.
+pub struct BucketSet<T: Copy> {
+    hot: Vec<(*mut T, *mut T)>, // (cur, end)
+    cold: Vec<Cold<T>>,
+}
+struct Cold<T> {
+    start: *mut T,
+    id: u32,
+    blocks: Vec<(*mut T, usize, u32)>,
+}
+unsafe impl<T: Copy> Send for BucketSet<T> {}
+unsafe impl<T: Copy> Sync for BucketSet<T> {}
+
+impl<T: Copy> BucketSet<T> {
+    pub fn new(n: usize) -> Self {
+        BucketSet {
+            hot: vec![(std::ptr::null_mut(), std::ptr::null_mut()); n],
+            cold: (0..n).map(|_| Cold { start: std::ptr::null_mut(), id: 0, blocks: Vec::new() }).collect(),
+        }
+    }
+    #[inline(always)]
+    pub fn push(&mut self, b: usize, v: T) {
+        let h = unsafe { self.hot.get_unchecked_mut(b) };
+        if h.0 == h.1 {
+            self.grow(b);
+        }
+        let h = unsafe { self.hot.get_unchecked_mut(b) };
+        unsafe {
+            h.0.write(v);
+            h.0 = h.0.add(1);
+        }
+    }
+    /// Push and return a handle (block id * per-block capacity + index).
+    #[inline(always)]
+    pub fn push_h(&mut self, b: usize, v: T) -> u32 {
+        let h = unsafe { self.hot.get_unchecked_mut(b) };
+        if h.0 == h.1 {
+            self.grow(b);
+        }
+        let cap = (arena().block_bytes() / std::mem::size_of::<T>()) as u32;
+        let c = unsafe { self.cold.get_unchecked(b) };
+        let h = unsafe { self.hot.get_unchecked_mut(b) };
+        unsafe {
+            let handle = c.id * cap + h.0.offset_from(c.start) as u32;
+            h.0.write(v);
+            h.0 = h.0.add(1);
+            handle
+        }
+    }
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self, b: usize) {
+        let c = &mut self.cold[b];
+        let h = &mut self.hot[b];
+        if !c.start.is_null() {
+            let n = unsafe { h.0.offset_from(c.start) as usize };
+            c.blocks.push((c.start, n, c.id));
+        }
+        let a = arena();
+        let (p, id) = a.alloc();
+        let p = p as *mut T;
+        let cap = a.block_bytes() / std::mem::size_of::<T>();
+        c.start = p;
+        c.id = id;
+        *h = (p, unsafe { p.add(cap) });
+    }
+    pub fn len(&self, b: usize) -> usize {
+        let c = &self.cold[b];
+        c.blocks.iter().map(|x| x.1).sum::<usize>()
+            + if c.start.is_null() { 0 } else { unsafe { self.hot[b].0.offset_from(c.start) as usize } }
+    }
+    #[inline(always)]
+    pub fn for_slices(&self, b: usize, mut f: impl FnMut(&[T])) {
+        let c = &self.cold[b];
+        for &(p, n, _) in &c.blocks {
+            f(unsafe { std::slice::from_raw_parts(p, n) });
+        }
+        if !c.start.is_null() {
+            let n = unsafe { self.hot[b].0.offset_from(c.start) as usize };
+            f(unsafe { std::slice::from_raw_parts(c.start, n) });
+        }
+    }
+    /// Return every block to the arena.
+    pub fn release_all(&mut self) {
+        let mut v: Vec<(usize, u32)> = Vec::new();
+        for (b, c) in self.cold.iter_mut().enumerate() {
+            for &(p, _, id) in &c.blocks {
+                v.push((p as usize, id));
+            }
+            if !c.start.is_null() {
+                v.push((c.start as usize, c.id));
+            }
+            c.blocks.clear();
+            c.start = std::ptr::null_mut();
+            self.hot[b] = (std::ptr::null_mut(), std::ptr::null_mut());
+        }
+        arena().release(&v);
+    }
+}
