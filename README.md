@@ -16,7 +16,7 @@ All phases run on `NCPU` threads with work-stealing over chunks or buckets.
 
 Notes:
 - Bucket storage is chains of blocks from a huge-page arena. Blocks freed by one phase are reused by the next.
-- Parquet is written by a small built-in writer: PLAIN encoding, uncompressed, one row group.
+- Parquet is written by a small built-in writer: uncompressed, one row group, with dictionary encoding for low-cardinality columns.
 - Strings are never copied. Every ID is a pointer into the mmapped input.
 
 ## Build and test
@@ -24,7 +24,8 @@ Notes:
 ```sh
 cargo build --release
 cargo test --release                       # differential fuzz tests (CSV splitter, timestamps)
-python3 scripts/run_fixtures.py fixtures -- target/x86_64-unknown-linux-gnu/release/ss
+# with the starter's scripts and fixtures:
+python3 <starter>/scripts/run_fixtures.py <starter>/fixtures -- target/x86_64-unknown-linux-gnu/release/ss
 docker build -t shopping-sessions .
 ```
 
