@@ -17,7 +17,8 @@ pub struct PersonWork {
     pub active: Vec<u32>,
     pub catsum: Vec<u64>,
     pub touched: Vec<u16>,
-    pub camp_acc: Vec<[u64; 4]>, // sessions, purchasing, revenue, assisted
+    pub camp_acc: Vec<[u64; 4]>, // [camp * ndays + day]: sessions, purchasing, revenue, (unused)
+    pub assist: Vec<u32>,        // [day * ncamp + camp]: assisted sessions (dense, cache-resident)
     pub rows: Vec<URow>,
     pub namebuf: Vec<u8>,
 }
@@ -145,8 +146,9 @@ pub fn process_person(ev: &[Ev], cs: &[Ck], name_ref: u64, w: &mut PersonWork, w
         a[0] += 1;
         a[1] += purch as u64;
         a[2] += rev;
+        let row = di * w.cnt.len();
         for &c in &w.active {
-            w.camp_acc[c as usize * ndays + di][3] += 1;
+            unsafe { *w.assist.get_unchecked_mut(row + c as usize) += 1 };
         }
     }
     flush_day(w, &acc, name);

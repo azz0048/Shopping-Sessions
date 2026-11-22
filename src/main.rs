@@ -1155,6 +1155,7 @@ fn main() {
             catsum: vec![0; ncats],
             touched: Vec::new(),
             camp_acc: vec![[0; 4]; ncamp * ndays],
+            assist: vec![0; ncamp * ndays],
             rows: Vec::new(),
             namebuf: Vec::new(),
         };
@@ -1318,9 +1319,10 @@ fn main() {
             let mut v = [0u64; 4];
             for w in &works {
                 let a = &w.camp_acc[c * ndays + d];
-                for k in 0..4 {
+                for k in 0..3 {
                     v[k] += a[k];
                 }
+                v[3] += w.assist[d * ncamp + c] as u64;
             }
             if v[0] > 0 || v[3] > 0 {
                 crow.push(CRow { camp: camp_names[c], chan: camp_chan[c], day: (day0 + d as i64) as i32, v });
