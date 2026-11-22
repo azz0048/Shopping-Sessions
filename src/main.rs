@@ -434,17 +434,25 @@ fn parse_clicks_chunk<const V: u8>(c: &Chunk, ctx: &Ctx, out: &mut ParseOut) {
     }
 }
 
-/// P1 chunk parsers compiled with AVX-512BW/VL (masks into k registers); see 4_mode.
+/// P1 chunk parsers compiled with AVX-512BW/VL (masks into k registers); see v4_mode.
 #[target_feature(enable = "avx512bw,avx512vl")]
 unsafe fn parse_chunk_v4<const V: u8>(c: &Chunk, ctx: &Ctx, out: &mut ParseOut) {
     if c.kind == 0 { parse_events_chunk::<V>(c, ctx, out) } else { parse_clicks_chunk::<V>(c, ctx, out) }
 }
+fn parse_chunk_v2<const V: u8>(c: &Chunk, ctx: &Ctx, out: &mut ParseOut) {
+    if c.kind == 0 { parse_events_chunk::<V>(c, ctx, out) } else { parse_clicks_chunk::<V>(c, ctx, out) }
+}
+/// Parser variant `mode` (see v4_mode): one monomorphized loop per variant, chosen per chunk.
 fn parse_chunk(mode: u8, c: &Chunk, ctx: &Ctx, out: &mut ParseOut) {
-    match mode {
-        1 => unsafe { parse_chunk_v4::<1>(c, ctx, out) },
-        2 => unsafe { parse_chunk_v4::<2>(c, ctx, out) },
-        _ => if c.kind == 0 { parse_events_chunk::<0>(c, ctx, out) } else { parse_clicks_chunk::<0>(c, ctx, out) },
+    macro_rules! go {
+        ($($m:literal)*) => {
+            match mode {
+                $($m => if $m & 3 == 0 { parse_chunk_v2::<$m>(c, ctx, out) } else { unsafe { parse_chunk_v4::<$m>(c, ctx, out) } },)*
+                _ => parse_chunk_v2::<0>(c, ctx, out),
+            }
+        };
     }
+    go!(0 1 2 4 5 6 8 9 10 12 13 14)
 }
 
 // ---------- links ----------

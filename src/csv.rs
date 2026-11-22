@@ -243,12 +243,20 @@ pub unsafe fn masks64_v4y(p: *const u8) -> (u64, u64, u64) {
     (n, c, q)
 }
 
-/// Which mask kernel P1 uses: 0 = AVX2 (default anywhere), 1 = AVX-512 ymm asm (default when
-/// avx512bw+vl exist), 2 = AVX-512 intrinsics (compiled to zmm). SS_V4MODE overrides (diag A/B).
+/// P1 parser variant, one byte (all variants produce identical results; they differ in speed):
+///   bits 0-1  mask kernel: 0 = AVX2, 1 = AVX-512 ymm asm, 2 = AVX-512 intrinsics (zmm)
+///   bit 2     fast path for lines without any quote
+///   bit 3     field boundaries via pdep (independent) instead of a serial 128-bit chain
+/// Kernel default: 0 (AVX2), SS_V4MODE overrides; AVX-512 kernels only where supported.
+/// SS_P1FLAGS sets bits 2-3 (diag A/B on the scorer).
+pub const P1_DEFAULT_KERNEL: u8 = 0;
+pub const P1_DEFAULT_FLAGS: u8 = 0;
 pub fn v4_mode() -> u8 {
     let have = std::is_x86_feature_detected!("avx512bw") && std::is_x86_feature_detected!("avx512vl");
-    let want = std::env::var("SS_V4MODE").ok().and_then(|v| v.parse::<u8>().ok()).unwrap_or(1);
-    if have { want.min(2) } else { 0 }
+    let want = std::env::var("SS_V4MODE").ok().and_then(|v| v.parse::<u8>().ok()).unwrap_or(P1_DEFAULT_KERNEL);
+    let kernel = if have { want.min(2) } else { 0 };
+    let flags = std::env::var("SS_P1FLAGS").ok().and_then(|v| v.parse::<u8>().ok()).unwrap_or(P1_DEFAULT_FLAGS) & 12;
+    kernel | flags
 }
 
 /// Inclusive prefix xor of a 64-bit mask (bit i = parity of bits 0..=i).
@@ -274,8 +282,8 @@ pub fn split_at2<const N: usize>(data: &'static [u8], p: usize, out: &mut [&'sta
     split_at2g::<N, 0>(data, p, out)
 }
 
-/// split_at2 with mask kernel V (see 4_mode); V > 0 only from code compiled with
-/// avx512bw+avx512vl, after checking 4_mode().
+/// split_at2 with mask kernel V (see v4_mode); V > 0 only from code compiled with
+/// avx512bw+avx512vl, after checking v4_mode().
 #[inline(always)]
 pub fn split_at2g<const N: usize, const V: u8>(data: &'static [u8], p: usize, out: &mut [&'static [u8]; N]) -> (usize, bool) {
     if p + 128 <= data.len() {
@@ -283,7 +291,7 @@ pub fn split_at2g<const N: usize, const V: u8>(data: &'static [u8], p: usize, ou
             unsafe { _mm_prefetch(data.as_ptr().wrapping_add(p + PREFETCH) as *const i8, _MM_HINT_T0) };
         }
         let base = unsafe { data.as_ptr().add(p) };
-        let (n0, c0, q0) = unsafe { match V { 0 => masks64(base), 1 => masks64_v4y(base), _ => masks64_v4(base) } };
+        let (n0, c0, q0) = unsafe { match V & 3 { 0 => masks64(base), 1 => masks64_v4y(base), _ => masks64_v4(base) } };
         let found;
         let (len, c, q): (usize, u128, u128);
         if n0 != 0 {
@@ -294,7 +302,7 @@ pub fn split_at2g<const N: usize, const V: u8>(data: &'static [u8], p: usize, ou
             q = (q0 & m) as u128;
             found = true;
         } else {
-            let (n1, c1, q1) = unsafe { match V { 0 => masks64(base.add(64)), 1 => masks64_v4y(base.add(64)), _ => masks64_v4(base.add(64)) } };
+            let (n1, c1, q1) = unsafe { match V & 3 { 0 => masks64(base.add(64)), 1 => masks64_v4y(base.add(64)), _ => masks64_v4(base.add(64)) } };
             let l = n1.trailing_zeros() as usize; // 64 if none
             let m = if l == 64 { 0 } else { (1u64 << l) - 1 };
             len = 64 + l;
@@ -307,6 +315,23 @@ pub fn split_at2g<const N: usize, const V: u8>(data: &'static [u8], p: usize, ou
             if c.count_ones() as usize != N - 1 {
                 return (next, false);
             }
+            if V & 4 != 0 && q == 0 {
+                // no quote anywhere: valid, and every field is just the bytes between commas
+                let mut cc = c;
+                let mut a = 0usize;
+                for k in 0..N {
+                    let b = if k + 1 < N {
+                        let t = cc.trailing_zeros() as usize;
+                        cc &= cc.wrapping_sub(1);
+                        t
+                    } else {
+                        len
+                    };
+                    out[k] = unsafe { std::slice::from_raw_parts(base.add(a), b - a) };
+                    a = b + 1;
+                }
+                return (next, true);
+            }
             // len >= N-1 >= 1 here
             let s = (c << 1) | 1;
             let e = (c >> 1) | (1u128 << (len - 1));
@@ -315,12 +340,21 @@ pub fn split_at2g<const N: usize, const V: u8>(data: &'static [u8], p: usize, ou
             let inside = lo as u128 | ((hi as u128) << 64);
             let valid = (q & !(s | e)) == 0 && q.count_ones() & 1 == 0 && (inside & c) == 0;
             let mut cc = c;
+            let (c0, c1) = (c as u64, (c >> 64) as u64);
+            let nc0 = c0.count_ones();
             let mut a = 0usize;
             for k in 0..N {
                 let b = if k + 1 < N {
-                    let t = cc.trailing_zeros() as usize;
-                    cc &= cc.wrapping_sub(1);
-                    t
+                    if V & 8 != 0 {
+                        let p0 = unsafe { _pdep_u64(1u64 << k, c0) }.trailing_zeros();
+                        let k1 = (k as u32).wrapping_sub(nc0) & 63;
+                        let p1 = 64 + unsafe { _pdep_u64(1u64 << k1, c1) }.trailing_zeros();
+                        (if (k as u32) < nc0 { p0 } else { p1 }) as usize
+                    } else {
+                        let t = cc.trailing_zeros() as usize;
+                        cc &= cc.wrapping_sub(1);
+                        t
+                    }
                 } else {
                     len
                 };

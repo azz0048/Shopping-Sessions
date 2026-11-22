@@ -10,13 +10,18 @@ pub const K1: u64 = 0xe7037ed1a0b428db;
 pub const K2: u64 = 0x8ebc6af09c88c6e3;
 pub const K3: u64 = 0x589965cc75374cc3;
 
+// Unchecked little-endian loads: every call site below reads inside [0, s.len()) by
+// construction (offsets derived from n = s.len() as in wyhash), so the bounds checks the
+// slice form compiled into the hot parse loop are pure overhead.
 #[inline(always)]
 pub fn rd8(s: &[u8], i: usize) -> u64 {
-    u64::from_le_bytes(s[i..i + 8].try_into().unwrap())
+    debug_assert!(i + 8 <= s.len());
+    unsafe { (s.as_ptr().add(i) as *const u64).read_unaligned() }
 }
 #[inline(always)]
 pub fn rd4(s: &[u8], i: usize) -> u64 {
-    u32::from_le_bytes(s[i..i + 4].try_into().unwrap()) as u64
+    debug_assert!(i + 4 <= s.len());
+    unsafe { (s.as_ptr().add(i) as *const u32).read_unaligned() as u64 }
 }
 
 /// wyhash-style 64-bit hash with seed.

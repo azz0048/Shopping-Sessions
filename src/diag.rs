@@ -221,11 +221,12 @@ pub fn diag_main() -> ! {
         sum.push(l);
     }
     // output equality across kernels: order-independent checksum of the SS_CSV dumps
-    if let Some(modes) = std::env::var("SS_DIAG_CMP").ok().or(Some("0,1,2".into())) {
+    if let Some(modes) = std::env::var("SS_DIAG_CMP").ok().or(Some("0,1,2,0f12".into())) {
         let mut sums = Vec::new();
         for m in modes.split(',') {
             let csv = scratch.join(format!("csv{m}"));
-            let _ = run_child("cmp", &p20, &o, &[("SS_V4MODE", m), ("SS_CSV", csv.to_str().unwrap())]);
+            let (k, fl) = m.split_once('f').unwrap_or((m, "0"));
+            let _ = run_child("cmp", &p20, &o, &[("SS_V4MODE", k), ("SS_P1FLAGS", fl), ("SS_CSV", csv.to_str().unwrap())]);
             let mut acc = (0u64, 0u64);
             for t in ["user_daily.csv", "campaign_daily.csv"] {
                 let text = std::fs::read(csv.join(t)).unwrap_or_default();
