@@ -6,6 +6,7 @@ use std::sync::Mutex;
 pub struct Arena {
     block: usize,
     region: usize,
+    old_refill: bool, // diag A/B: SS_OLDARENA=1 restores 32-block fresh refills
     state: Mutex<State>,
 }
 struct State {
@@ -42,20 +43,24 @@ fn map_region(size: usize) -> usize {
     p as usize
 }
 
+pub const HUGE: usize = 2 << 20;
+
+/// Anonymous, THP-advised, 2 MB-aligned mapping.
 #[cfg(unix)]
 fn map_region(size: usize) -> usize {
     unsafe {
         let p = libc::mmap(
             std::ptr::null_mut(),
-            size,
+            size + HUGE,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
             -1,
             0,
         );
         assert!(p != libc::MAP_FAILED, "arena mmap failed");
-        libc::madvise(p, size, libc::MADV_HUGEPAGE);
-        p as usize
+        let a = (p as usize + HUGE - 1) & !(HUGE - 1);
+        libc::madvise(a as *mut libc::c_void, size, libc::MADV_HUGEPAGE);
+        a
     }
 }
 
@@ -64,7 +69,7 @@ fn map_region(size: usize) -> usize {
 pub fn init_arena(region: usize, block: usize) {
     let region = region.max(block * 64) / block * block;
     unsafe {
-        ARENA = Some(Arena { block, region, state: Mutex::new(State { cur: 0, end: 0, free: Vec::new(), ptrs: Vec::new() }) });
+        ARENA = Some(Arena { block, region, old_refill: std::env::var_os("SS_OLDARENA").is_some(), state: Mutex::new(State { cur: 0, end: 0, free: Vec::new(), ptrs: Vec::new() }) });
     }
 }
 
@@ -82,21 +87,30 @@ impl Arena {
                 return (p as *mut u8, id);
             }
             let mut st = self.state.lock().unwrap();
-            for _ in 0..32 {
-                if let Some(x) = st.free.pop() {
-                    c.push(x);
-                    continue;
+            if !st.free.is_empty() {
+                // recycled blocks (already faulted in)
+                for _ in 0..32 {
+                    match st.free.pop() {
+                        Some(x) => c.push(x),
+                        None => break,
+                    }
                 }
-                if st.cur + self.block > st.end {
-                    let r = map_region(self.region);
-                    st.cur = r;
-                    st.end = r + self.region;
+            } else {
+                // fresh memory: a whole 2 MB huge page per refill, so no two threads ever fault
+                // the same huge page (concurrent faults on one THP serialize and are very slow)
+                let n = if self.old_refill { 32 } else { (HUGE / self.block).max(1) };
+                for _ in 0..n {
+                    if st.cur + self.block > st.end {
+                        let r = map_region(self.region);
+                        st.cur = r;
+                        st.end = r + self.region;
+                    }
+                    let p = st.cur;
+                    st.cur += self.block;
+                    let id = st.ptrs.len() as u32;
+                    st.ptrs.push(p);
+                    c.push((p, id));
                 }
-                let p = st.cur;
-                st.cur += self.block;
-                let id = st.ptrs.len() as u32;
-                st.ptrs.push(p);
-                c.push((p, id));
             }
             // hand out the lowest address first so a thread's blocks stay contiguous
             c.reverse();

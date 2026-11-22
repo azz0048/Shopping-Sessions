@@ -9,6 +9,10 @@
 //   P4 per person bucket: sort, sessionize, attribute, aggregate; write user_daily parts
 mod arena;
 mod csv;
+#[cfg(feature = "diag")]
+mod datagen;
+#[cfg(feature = "diag")]
+mod diag;
 mod files;
 mod hash;
 mod out;
@@ -627,11 +631,21 @@ fn build_links(lp: Vec<LinkParse>, nthreads: usize) -> Links {
         let (lp, off, tab_off, tab_mask, side_off) = (&lp, &off, &tab_off, &tab_mask, &side_off);
         run_threads(nthreads, |_| {
             let (tk, tv, dr, dp, pi, us) = (&tk, &tv, &dr, &dp, &pi, &us);
+            // runs of 32 adjacent buckets per grab: their table slices are contiguous, so threads
+            // mostly fault disjoint huge pages
+            let mut bs = 0..0;
             loop {
-                let b = next.fetch_add(1, Relaxed);
-                if b >= UB {
-                    break;
-                }
+                let b = match bs.next() {
+                    Some(b) => b,
+                    None => {
+                        let s = next.fetch_add(32, Relaxed);
+                        if s >= UB {
+                            break;
+                        }
+                        bs = s + 1..(s + 32).min(UB);
+                        s
+                    }
+                };
                 let (to, mask, so) = (tab_off[b], tab_mask[b], side_off[b]);
                 let mut nd = 0u32;
                 for (ti, l) in lp.iter().enumerate() {
@@ -777,6 +791,10 @@ fn build_links(lp: Vec<LinkParse>, nthreads: usize) -> Links {
 }
 
 fn main() {
+    #[cfg(feature = "diag")]
+    if std::env::var_os("SS_CHILD").is_none() {
+        diag::diag_main();
+    }
     let t0 = Instant::now();
     let args: Vec<String> = std::env::args().collect();
     let data_dir = PathBuf::from(
