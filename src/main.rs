@@ -36,7 +36,7 @@ pub const GAP: i64 = 1_800_000;
 pub const WEEK: i64 = 604_800_000;
 pub const LATE: i64 = 86_400_000;
 /// Threads building links in the background during P1/P2 (0 = build them up front).
-pub const LINKS_OVERLAP_DEFAULT: usize = 0;
+pub const LINKS_OVERLAP_DEFAULT: usize = 4; // scorer A/B: 703 vs 713 ms in-process
 
 const EB_BITS: u32 = 10; // event-id buckets
 const EB: usize = 1 << EB_BITS;
