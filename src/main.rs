@@ -507,6 +507,8 @@ pub struct Links {
     // per user bucket: open-addressing table slice [tab_off, tab_off + mask + 1)
     tab_off: Vec<usize>,
     tab_mask: Vec<usize>,
+    /// distinct IDs interned per bucket (occupied table slots after build)
+    occ: Vec<u32>,
     tkeys: &'static [u64],
     /// person id (global side index of the component's byte-smallest ID) per table slot
     tvals: &'static [u32],
@@ -654,6 +656,7 @@ fn build_links(lp: Vec<LinkParse>, nthreads: usize) -> Links {
     let dref: &'static mut [u64] = huge_zeroed(s_total);
     let dpre: &'static mut [u64] = huge_zeroed(s_total);
     let pair_ids: &'static mut [u32] = huge_zeroed(2 * npairs);
+    let mut occ: Vec<u32> = vec![0; UB];
     let used: &'static mut [u8] = huge_zeroed(s_total);
     // intern per bucket (each bucket owns disjoint slices)
     {
@@ -663,10 +666,11 @@ fn build_links(lp: Vec<LinkParse>, nthreads: usize) -> Links {
         let dr = SendPtr(dref.as_mut_ptr());
         let pi = SendPtr(pair_ids.as_mut_ptr());
         let us = SendPtr(used.as_mut_ptr());
+        let oc = SendPtr(occ.as_mut_ptr());
         let next = AtomicUsize::new(0);
         let (lp, off, tab_off, tab_mask, side_off) = (&lp, &off, &tab_off, &tab_mask, &side_off);
         run_threads(nthreads, |_| {
-            let (tk, tv, dr, dp, pi, us) = (&tk, &tv, &dr, &dp, &pi, &us);
+            let (tk, tv, dr, dp, pi, us, oc) = (&tk, &tv, &dr, &dp, &pi, &us, &oc);
             // runs of 32 adjacent buckets per grab: their table slices are contiguous, so threads
             // mostly fault disjoint huge pages
             let mut bs = 0..0;
@@ -708,6 +712,7 @@ fn build_links(lp: Vec<LinkParse>, nthreads: usize) -> Links {
                         unsafe { *pi.0.add((off[ti] + si) as usize) = (so + id as usize) as u32 };
                     });
                 }
+                unsafe { *oc.0.add(b) = nd };
             }
         });
     }
@@ -823,7 +828,7 @@ fn build_links(lp: Vec<LinkParse>, nthreads: usize) -> Links {
     }
     let s_round = s_total.div_ceil(UB) * UB;
     assert!(s_round < (1 << 31), "too many linked IDs");
-    Links { tab_off, tab_mask, tkeys, tvals, dref, s_round: s_round as u32 }
+    Links { tab_off, tab_mask, occ, tkeys, tvals, dref, s_round: s_round as u32 }
 }
 
 fn main() {
@@ -1192,6 +1197,7 @@ fn main() {
     let next = AtomicUsize::new(0);
     type P3Out = (WcSet<Ev, 16>, WcSet<Ck, 8>, Vec<(usize, Vec<u64>)>);
     let s_round = links.s_round;
+    let p3_spill_all = std::env::var_os("SS_P3SPILL").is_some(); // test: force the overflow path
     let order = lpt_order(|b| pouts.iter().map(|po| po.recs.len(b) + po.ck.len(b)).sum(), UB);
     let mouts: Vec<P3Out> = run_threads(nthreads, |_| {
         let mut eo: WcSet<Ev, 16> = WcSet::new(UB);
@@ -1207,6 +1213,16 @@ fn main() {
             let mut nm: Vec<u64> = Vec::new();
             let nb: usize = pouts.iter().map(|po| po.recs.len(b)).sum();
             seen.reset(nb / 8 + 64);
+            // Unlinked users go into this bucket's link-table slice (value flagged UNLINKED |
+            // local id) at the empty slot their lookup ended on, so each event costs one probe.
+            // Only this thread touches this slice now, and nothing reads the table after P3.
+            // Past 3/4 load the rest spill to `seen`.
+            const UNLINKED: u32 = 1 << 31;
+            let (toff, tmask) = (links.tab_off[b], links.tab_mask[b]);
+            let tk = links.tkeys.as_ptr() as *mut u64;
+            let tv = links.tvals.as_ptr() as *mut u32;
+            let limit = if p3_spill_all { 0 } else { (tmask + 1) * 3 / 4 };
+            let mut occ = links.occ[b] as usize;
             // all events of the bucket first, so every unlinked user with events has its id
             for po in pouts.iter() {
                 po.recs.for_slices(b, |x| {
@@ -1214,33 +1230,58 @@ fn main() {
                         if r.ts == u32::MAX {
                             continue;
                         }
-                        let pid = match links.lookup(b, r.user) {
-                            Some(p) => p,
-                            None => {
-                                let n = nm.len() as u32;
-                                let l = seen.insert_grow(r.user, n, n as usize);
-                                if l == n {
-                                    nm.push(r.uref);
-                                }
-                                s_round + ((l << UB_BITS) | b as u32)
+                        let h = r.user;
+                        let mut s = (h as usize) & tmask;
+                        let pid = loop {
+                            let k = unsafe { *tk.add(toff + s) };
+                            if k == h {
+                                let v = unsafe { *tv.add(toff + s) };
+                                break if v & UNLINKED != 0 { s_round + (((v & !UNLINKED) << UB_BITS) | b as u32) } else { v };
                             }
+                            if k == 0 {
+                                let n = nm.len() as u32;
+                                let l = if occ < limit {
+                                    unsafe {
+                                        *tk.add(toff + s) = h;
+                                        *tv.add(toff + s) = UNLINKED | n;
+                                    }
+                                    occ += 1;
+                                    nm.push(r.uref);
+                                    n
+                                } else {
+                                    let l = seen.insert_grow(h, n, n as usize);
+                                    if l == n {
+                                        nm.push(r.uref);
+                                    }
+                                    l
+                                };
+                                break s_round + ((l << UB_BITS) | b as u32);
+                            }
+                            s = (s + 1) & tmask;
                         };
                         eo.push(pid as usize & (UB - 1), Ev { ts: r.ts, pc: r.pc, pid });
                     }
                 });
             }
-            assert!(((nm.len() as u64) << UB_BITS) + (s_round as u64) < (1u64 << 32), "too many unlinked users");
+            assert!(((nm.len() as u64) << UB_BITS) + (s_round as u64) < (1u64 << 31), "too many unlinked users");
             // clicks of unlinked users without events can never credit a session: dropped
             for po in pouts.iter() {
                 po.ck.for_slices(b, |x| {
                     for c in x {
-                        let pid = match links.lookup(b, c.user) {
-                            Some(p) => p,
-                            None => match seen.get(c.user) {
-                                Some(l) => s_round + ((l << UB_BITS) | b as u32),
-                                None => continue,
-                            },
+                        let h = c.user;
+                        let mut s = (h as usize) & tmask;
+                        let pid = loop {
+                            let k = unsafe { *tk.add(toff + s) };
+                            if k == h {
+                                let v = unsafe { *tv.add(toff + s) };
+                                break Some(if v & UNLINKED != 0 { s_round + (((v & !UNLINKED) << UB_BITS) | b as u32) } else { v });
+                            }
+                            if k == 0 {
+                                break seen.get(h).map(|l| s_round + ((l << UB_BITS) | b as u32));
+                            }
+                            s = (s + 1) & tmask;
                         };
+                        let Some(pid) = pid else { continue };
                         co.push(pid as usize & (UB - 1), Ck { cid: c.cid, pid, ts: c.ts, camp: c.camp, _pad: 0 });
                     }
                 });
