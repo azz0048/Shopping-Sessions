@@ -68,13 +68,16 @@ fn run_child(tag: &str, data: &Path, out: &Path, envs: &[(&str, &str)]) -> (f64,
     );
     let pre = if !pf.is_nan() { pf } else if !pt.is_nan() { pt } else { setup };
     let extra = if !pt.is_nan() || !pf.is_nan() {
-        format!(" [pretouch {:.0} prefault {:.0}]", if pt.is_nan() { 0.0 } else { pt - setup }, if pf.is_nan() { 0.0 } else { pf - if pt.is_nan() { setup } else { pt } })
+        format!(" [pt {:.0} pf {:.0}]", if pt.is_nan() { 0.0 } else { pt - setup }, if pf.is_nan() { 0.0 } else { pf - if pt.is_nan() { setup } else { pt } })
     } else {
         String::new()
     };
+    if let Some(l) = err.lines().find(|l| l.contains("ns/line")) {
+        return (wall, format!("{tag} {}", l.trim()));
+    }
     let line = format!(
-        "{tag:<22} wall {wall:6.1} | setup {setup:5.1} links {:5.1} P1 {:6.1} P2 {:5.1} P3 {:5.1} P4 {:6.1} end {:5.1} | exit+start {:5.1}{extra}{}",
-        lb - pre, p1 - lb, p2 - p1, p3 - p2, p4 - p3, done - p4, wall - done,
+        "{tag}: P1 {:.0} | L {:.0} P2 {:.0} P3 {:.0} P4 {:.0} | in {:.0} wall {wall:.0}{extra}{}",
+        p1 - lb, lb - pre, p2 - p1, p3 - p2, p4 - p3, done - pre,
         if o.status.success() { "" } else { " FAILED" }
     );
     (wall, line)
@@ -115,7 +118,7 @@ fn fault_bench(label: &str, bytes: usize, huge: bool, nthreads: usize) -> String
         let t = Instant::now();
         libc::munmap(p, bytes);
         let tu = t.elapsed().as_secs_f64() * 1e3;
-        format!("{label}: touch {tf:.1} ms, memset {tw:.1} ms ({:.1} GB/s), munmap {tu:.1} ms", bytes as f64 / tw / 1e6)
+        format!("{label}: touch {tf:.0} memset {tw:.0} ({:.1} GB/s) munmap {tu:.0}", bytes as f64 / tw / 1e6)
     }
 }
 
@@ -181,7 +184,7 @@ fn file_fault_bench(files: &[PathBuf], nthreads: usize) -> String {
         }
     });
     let trd = t.elapsed().as_secs_f64() * 1e3;
-    format!("events mmap {} MB: first-touch {tf:.1} ms, stream {tr:.1} ms ({:.1} GB/s), munmap {tu:.1} ms; read() 1MB bufs {trd:.1} ms ({:.1} GB/s)",
+    format!("mmap {}MB: touch {tf:.0} stream {tr:.0} ({:.1} GB/s) munmap {tu:.0}; read() {trd:.0} ({:.1} GB/s)",
         total >> 20, total as f64 / tr / 1e6, total as f64 / trd / 1e6)
 }
 
@@ -189,44 +192,31 @@ pub fn diag_main() -> ! {
     let t0 = Instant::now();
     let nthreads: usize = std::env::var("NCPU").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
     let mut sum: Vec<String> = Vec::new();
-    sum.push(format!("cpu: {}", grab("/proc/cpuinfo", |l| l.starts_with("model name") || l.starts_with("cpu MHz") || l.starts_with("cache size") || l.starts_with("siblings") || l.starts_with("cpu cores"), 5)));
-    sum.push(format!("avx512f: {} | nproc {:?} | cpus_allowed {}", grab("/proc/cpuinfo", |l| l.starts_with("flags"), 1).contains("avx512f"), std::thread::available_parallelism().map(|n| n.get()), grab("/proc/self/status", |l| l.starts_with("Cpus_allowed_list"), 1)));
-    sum.push(format!("kernel: {}", grab("/proc/version", |_| true, 1)));
-    sum.push(format!("thp: enabled {} | defrag {}", grab("/sys/kernel/mm/transparent_hugepage/enabled", |_| true, 1), grab("/sys/kernel/mm/transparent_hugepage/defrag", |_| true, 1)));
-    sum.push(format!("mem: {}", grab("/proc/meminfo", |l| ["MemTotal", "MemAvailable", "Cached", "AnonHugePages"].iter().any(|k| l.starts_with(k)), 4)));
-    sum.push(format!("cgroup: cpu.max {} | memory.max {}", grab("/sys/fs/cgroup/cpu.max", |_| true, 1), grab("/sys/fs/cgroup/memory.max", |_| true, 1)));
-    sum.push(format!("mounts: {}", grab("/proc/mounts", |l| l.contains(" /data ") || l.contains(" /scratch ") || l.contains(" /output ") || l.contains(" / "), 4)));
-    sum.push(format!("smt: {} | cpu0 siblings {}", grab("/sys/devices/system/cpu/smt/active", |_| true, 1), grab("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list", |_| true, 1)));
-
-    let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
     let scratch = PathBuf::from(std::env::var("SCRATCH_DIR").unwrap_or("/scratch".into()));
-    let dev_files: Vec<PathBuf> = ["events", "clicks", "links"].iter().flat_map(|d| list_csv(&data.join(d))).collect();
-    let (r, t) = residency(&dev_files);
-    sum.push(format!("/data residency at start: {r}/{t} pages"));
-    let (_, l) = run_child("dev", &data, &scratch.join("o_dev"), &[]);
-    sum.push(l);
-
     let p20 = scratch.join("p20");
-    let tg = Instant::now();
     let nev: u64 = std::env::var("SS_DIAG_EVENTS").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000_000);
     if let Err(e) = crate::datagen::generate(7, nev, nev / 4, &p20, nthreads) {
         eprintln!("generate failed: {e}");
         std::process::exit(1);
     }
-    let gen_s = tg.elapsed().as_secs_f64();
-    let p20_files: Vec<PathBuf> = ["events", "clicks", "links"].iter().flat_map(|d| list_csv(&p20.join(d))).collect();
-    let (r, t) = residency(&p20_files);
-    sum.push(format!("generated {nev} events in {gen_s:.1} s; residency {r}/{t} pages"));
     let o = scratch.join("o20");
-    let runs: [(&str, &[(&str, &str)]); 8] = [
-        ("p20 default", &[]),
-        ("p20 default", &[]),
-        ("p20 default", &[]),
-        ("p20 PREFAULT", &[("SS_PREFAULT", "1")]),
-        ("p20 PRETOUCH2", &[("SS_PRETOUCH", "2")]),
-        ("p20 PRETOUCH2+PREFAULT", &[("SS_PRETOUCH", "2"), ("SS_PREFAULT", "1")]),
-        ("p20 SS_POP", &[("SS_POP", "1")]),
-        ("p20 default", &[]),
+    let mut big: Vec<(u64, PathBuf)> = list_csv(&p20.join("events")).into_iter().map(|p| (std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0), p)).collect();
+    big.sort();
+    let bf = big.last().unwrap().1.to_string_lossy().to_string();
+    let runs: Vec<(&str, Vec<(&str, &str)>)> = vec![
+        ("def", vec![]),
+        ("def", vec![]),
+        ("NCPU4", vec![("NCPU", "4")]),
+        ("NCPU16", vec![("NCPU", "16")]),
+        ("PREFAULT", vec![("SS_PREFAULT", "1")]),
+        ("PRETOUCH", vec![("SS_PRETOUCH", "2")]),
+        ("PT+PF", vec![("SS_PRETOUCH", "2"), ("SS_PREFAULT", "1")]),
+        ("POP", vec![("SS_POP", "1")]),
+        ("bench full", vec![("SS_BENCHFILE", bf.as_str())]),
+        ("bench", vec![("SS_BENCHFILE", bf.as_str()), ("SS_BENCHMODE", "11")]),
+        ("bench", vec![("SS_BENCHFILE", bf.as_str()), ("SS_BENCHMODE", "12")]),
+        ("bench", vec![("SS_BENCHFILE", bf.as_str()), ("SS_BENCHMODE", "13")]),
+        ("bench", vec![("SS_BENCHFILE", bf.as_str()), ("SS_BENCHMODE", "14")]),
     ];
     for (tag, envs) in runs.iter() {
         let (_, l) = run_child(tag, &p20, &o, envs);
@@ -234,16 +224,13 @@ pub fn diag_main() -> ! {
     }
     #[cfg(unix)]
     {
-        sum.push(fault_bench("anon 1GB THP-advised 8thr", 1 << 30, true, nthreads));
-        sum.push(fault_bench("anon 1GB no-advice   8thr", 1 << 30, false, nthreads));
-        sum.push(fault_bench("anon 1GB THP-advised 1thr", 1 << 30, true, 1));
+        sum.push(fault_bench("anonTHP8", 1 << 30, true, nthreads));
+        sum.push(fault_bench("anon4k8", 1 << 30, false, nthreads));
         let ev: Vec<PathBuf> = list_csv(&p20.join("events"));
         sum.push(file_fault_bench(&ev, nthreads));
-        sum.push(file_fault_bench(&ev, nthreads));
     }
-    sum.push(format!("AnonHugePages now: {}", grab("/proc/meminfo", |l| l.starts_with("AnonHugePages"), 1)));
-    sum.push(format!("DIAG total {:.1} s; exiting 1 on purpose", t0.elapsed().as_secs_f64()));
-    eprintln!("==== DIAG2 SUMMARY ====");
+    sum.push(format!("total {:.1} s", t0.elapsed().as_secs_f64()));
+    eprintln!("==== DIAG3 ====");
     for l in &sum {
         eprintln!("{l}");
     }
