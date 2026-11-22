@@ -55,12 +55,15 @@ pub fn read_small_table(path: &Path) -> Vec<[&'static [u8]; 2]> {
     if d.is_empty() {
         return v;
     }
-    for_lines(d, 0, d.len(), |line| {
-        let mut f: [&'static [u8]; 2] = [&[]; 2];
-        if split::<2>(line, &mut f) {
+    let mut p = chunk_start(d, 0, d.len());
+    let mut f: [&'static [u8]; 2] = [&[]; 2];
+    while p < d.len() {
+        let (np, ok) = split_at::<2>(d, p, &mut f);
+        p = np;
+        if ok {
             v.push(f);
         }
-    });
+    }
     v
 }
 

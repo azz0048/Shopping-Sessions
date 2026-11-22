@@ -134,10 +134,7 @@ pub struct KeyMap {
 }
 impl KeyMap {
     pub fn build(keys: &[(&'static [u8], u32)]) -> KeyMap {
-        let mut km = KeyMap { prefix: vec![], arr: vec![], fast: false, map: SmallMap::new(keys.len()) };
-        for &(k, v) in keys {
-            km.map.insert(hash1(k), v);
-        }
+        let mut km = KeyMap { prefix: vec![], arr: vec![], fast: false, map: SmallMap::new(0) };
         if let Some(&(k0, _)) = keys.first() {
             let pl = k0.iter().position(|c| c.is_ascii_digit()).unwrap_or(k0.len());
             let prefix = k0[..pl].to_vec();
@@ -166,6 +163,12 @@ impl KeyMap {
                 km.prefix = prefix;
                 km.arr = arr;
                 km.fast = true;
+            }
+        }
+        if !km.fast {
+            km.map = SmallMap::new(keys.len());
+            for &(k, v) in keys {
+                km.map.insert(hash1(k), v);
             }
         }
         km
@@ -416,8 +419,18 @@ fn parse_clicks_chunk(c: &Chunk, ctx: &Ctx, out: &mut ParseOut) {
 }
 
 // ---------- links ----------
+/// One side of a link line: (hash, ref, 8-byte BE prefix, local side index).
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct Side {
+    h: u64,
+    r: u64,
+    pre: u64,
+    si: u32,
+    _pad: u32,
+}
 struct LinkParse {
-    sides: Vec<Vec<(u64, u64, u64, u32)>>, // per bucket: (hash, ref, 8-byte BE prefix, local side index)
+    sides: WcSet<Side, 2>, // scattered by user bucket
     npairs: usize,
 }
 
@@ -435,8 +448,8 @@ fn parse_links_chunk(c: &Chunk, out: &mut LinkParse) {
         out.npairs += 1;
         let ha = hash1(f[0]);
         let hb = hash1(f[1]);
-        out.sides[ub_of(ha)].push((ha, pack(f[0]), be_prefix(f[0]), 2 * i));
-        out.sides[ub_of(hb)].push((hb, pack(f[1]), be_prefix(f[1]), 2 * i + 1));
+        out.sides.push(ub_of(ha), Side { h: ha, r: pack(f[0]), pre: be_prefix(f[0]), si: 2 * i, _pad: 0 });
+        out.sides.push(ub_of(hb), Side { h: hb, r: pack(f[1]), pre: be_prefix(f[1]), si: 2 * i + 1, _pad: 0 });
     }
 }
 
@@ -595,7 +608,7 @@ fn build_links(lp: Vec<LinkParse>, nthreads: usize) -> Links {
     let mut side_off = vec![0usize; UB];
     let (mut t_total, mut s_total) = (0usize, 0usize);
     for b in 0..UB {
-        let n: usize = lp.iter().map(|l| l.sides[b].len()).sum();
+        let n: usize = lp.iter().map(|l| l.sides.len(b)).sum();
         let cap = (2 * n + 16).next_power_of_two();
         tab_off[b] = t_total;
         tab_mask[b] = cap - 1;
@@ -631,7 +644,7 @@ fn build_links(lp: Vec<LinkParse>, nthreads: usize) -> Links {
                 let (to, mask, so) = (tab_off[b], tab_mask[b], side_off[b]);
                 let mut nd = 0u32;
                 for (ti, l) in lp.iter().enumerate() {
-                    for &(h, r, pre, si) in &l.sides[b] {
+                    l.sides.for_slices(b, |x| for &Side { h, r, pre, si, .. } in x {
                         let mut s = (h as usize) & mask;
                         let id = loop {
                             let k = unsafe { *tk.0.add(to + s) };
@@ -653,10 +666,14 @@ fn build_links(lp: Vec<LinkParse>, nthreads: usize) -> Links {
                             s = (s + 1) & mask;
                         };
                         unsafe { *pi.0.add((off[ti] + si) as usize) = (so + id as usize) as u32 };
-                    }
+                    });
                 }
             }
         });
+    }
+    let mut lp = lp;
+    for l in lp.iter_mut() {
+        l.sides.release_all();
     }
     drop(lp);
     lap("interned");
@@ -800,13 +817,44 @@ fn main() {
 
     // products & campaigns
     let prows = read_small_table(&data_dir.join("products.csv"));
-    let mut cats: Vec<&'static [u8]> = prows.iter().map(|r| r[1]).collect();
-    cats.push(b"unknown");
-    cats.sort_unstable();
-    cats.dedup();
-    let unknown_cat = cats.binary_search(&&b"unknown"[..]).unwrap() as u16;
-    let pkeys: Vec<(&'static [u8], u32)> =
-        prows.iter().map(|r| (r[0], cats.binary_search(&r[1]).unwrap() as u32)).collect();
+    // distinct categories via a hash map (strings verified), then sort only the distinct ones
+    let (cats, unknown_cat, pkeys) = {
+        let mut cmap = SmallMap::new(64);
+        let mut distinct: Vec<&'static [u8]> = Vec::new();
+        let mut row_cat: Vec<u32> = Vec::with_capacity(prows.len());
+        let mut exact = true;
+        for s in prows.iter().map(|r| r[1]).chain(std::iter::once(&b"unknown"[..])) {
+            let i = distinct.len() as u32;
+            let j = cmap.insert_grow(hash1(s), i, i as usize);
+            if j == i {
+                distinct.push(s);
+            } else if distinct[j as usize] != s {
+                exact = false;
+            }
+            row_cat.push(j);
+        }
+        if exact {
+            let mut order: Vec<u32> = (0..distinct.len() as u32).collect();
+            order.sort_unstable_by(|&a, &b| distinct[a as usize].cmp(distinct[b as usize]));
+            let mut rank = vec![0u32; distinct.len()];
+            for (r, &o) in order.iter().enumerate() {
+                rank[o as usize] = r as u32;
+            }
+            let cats: Vec<&'static [u8]> = order.iter().map(|&o| distinct[o as usize]).collect();
+            let unknown_cat = rank[*row_cat.last().unwrap() as usize] as u16;
+            let pkeys: Vec<(&'static [u8], u32)> = prows.iter().zip(&row_cat).map(|(r, &c)| (r[0], rank[c as usize])).collect();
+            (cats, unknown_cat, pkeys)
+        } else {
+            let mut cats: Vec<&'static [u8]> = prows.iter().map(|r| r[1]).collect();
+            cats.push(b"unknown");
+            cats.sort_unstable();
+            cats.dedup();
+            let unknown_cat = cats.binary_search(&&b"unknown"[..]).unwrap() as u16;
+            let pkeys: Vec<(&'static [u8], u32)> =
+                prows.iter().map(|r| (r[0], cats.binary_search(&r[1]).unwrap() as u32)).collect();
+            (cats, unknown_cat, pkeys)
+        }
+    };
     let prod = KeyMap::build(&pkeys);
     let crows = read_small_table(&data_dir.join("campaigns.csv"));
     let mut camp_names: Vec<&'static [u8]> = Vec::new();
@@ -831,14 +879,18 @@ fn main() {
     let ncamp = camp_names.len();
     lap("setup");
 
+    let block: usize = std::env::var("SS_BLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(8192);
+    if std::env::var_os("SS_BENCHFILE").is_none() {
+        init_arena(1 << 30, block);
+    }
+
     // L: links
     let mut lchunks = Vec::new();
     let ltotal: usize = lk_files.iter().map(|d| d.len()).sum();
     make_chunks(&lk_files, 2, (ltotal / (nthreads * 4)).clamp(1 << 16, 8 << 20), &mut lchunks);
     let next = AtomicUsize::new(0);
     let lp: Vec<LinkParse> = run_threads(nthreads, |_| {
-        let est = ltotal / 22 / nthreads / UB * 2 + 8;
-        let mut out = LinkParse { sides: (0..UB).map(|_| Vec::with_capacity(est)).collect(), npairs: 0 };
+        let mut out = LinkParse { sides: WcSet::new(UB), npairs: 0 };
         loop {
             let i = next.fetch_add(1, Relaxed);
             if i >= lchunks.len() {
@@ -846,6 +898,7 @@ fn main() {
             }
             parse_links_chunk(&lchunks[i], &mut out);
         }
+        out.sides.finish();
         out
     });
     lap("links parsed");
@@ -884,8 +937,6 @@ fn main() {
     let etotal: usize = ev_files.iter().map(|d| d.len()).sum();
     let ctotal: usize = ck_files.iter().map(|d| d.len()).sum();
     let target = ((etotal + ctotal) / (nthreads * 24)).clamp(1 << 18, 16 << 20);
-    let block: usize = std::env::var("SS_BLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(8192);
-    init_arena(1 << 30, block);
     let mut chunks = Vec::new();
     make_chunks(&ev_files, 0, target, &mut chunks);
     make_chunks(&ck_files, 1, target, &mut chunks);
