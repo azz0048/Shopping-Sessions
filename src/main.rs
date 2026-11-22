@@ -339,14 +339,15 @@ struct ParseOut {
     ck: WcSet<CkU, 8>,
 }
 
-fn parse_events_chunk(c: &Chunk, ctx: &Ctx, out: &mut ParseOut) {
+#[inline(always)]
+fn parse_events_chunk<const V: u8>(c: &Chunk, ctx: &Ctx, out: &mut ParseOut) {
     let ws = ctx.ws;
     let we = ctx.we;
     let d = c.data;
     let mut p = chunk_start(d, c.start, c.end);
     let mut f: [&'static [u8]; 7] = [&[]; 7];
     while p < c.end {
-        let (np, ok) = split_at2::<7>(d, p, &mut f);
+        let (np, ok) = split_at2g::<7, V>(d, p, &mut f);
         p = np;
         if !ok {
             continue;
@@ -404,14 +405,15 @@ fn parse_events_chunk(c: &Chunk, ctx: &Ctx, out: &mut ParseOut) {
     }
 }
 
-fn parse_clicks_chunk(c: &Chunk, ctx: &Ctx, out: &mut ParseOut) {
+#[inline(always)]
+fn parse_clicks_chunk<const V: u8>(c: &Chunk, ctx: &Ctx, out: &mut ParseOut) {
     let lo = ctx.ws - WEEK;
     let hi = ctx.we;
     let d = c.data;
     let mut p = chunk_start(d, c.start, c.end);
     let mut f: [&'static [u8]; 4] = [&[]; 4];
     while p < c.end {
-        let (np, ok) = split_at2::<4>(d, p, &mut f);
+        let (np, ok) = split_at2g::<4, V>(d, p, &mut f);
         p = np;
         if !ok || f[0].is_empty() || f[1].is_empty() {
             continue;
@@ -429,6 +431,19 @@ fn parse_clicks_chunk(c: &Chunk, ctx: &Ctx, out: &mut ParseOut) {
         };
         let u = hash1(f[1]);
         out.ck.push(ub_of(u), CkU { user: u, cid: pack(f[0]), ts: (ts - lo) as u32, camp });
+    }
+}
+
+/// P1 chunk parsers compiled with AVX-512BW/VL (masks into k registers); see 4_mode.
+#[target_feature(enable = "avx512bw,avx512vl")]
+unsafe fn parse_chunk_v4<const V: u8>(c: &Chunk, ctx: &Ctx, out: &mut ParseOut) {
+    if c.kind == 0 { parse_events_chunk::<V>(c, ctx, out) } else { parse_clicks_chunk::<V>(c, ctx, out) }
+}
+fn parse_chunk(mode: u8, c: &Chunk, ctx: &Ctx, out: &mut ParseOut) {
+    match mode {
+        1 => unsafe { parse_chunk_v4::<1>(c, ctx, out) },
+        2 => unsafe { parse_chunk_v4::<2>(c, ctx, out) },
+        _ => if c.kind == 0 { parse_events_chunk::<0>(c, ctx, out) } else { parse_clicks_chunk::<0>(c, ctx, out) },
     }
 }
 
@@ -971,7 +986,7 @@ fn main() {
                 let mut f: [&'static [u8]; 7] = [&[]; 7];
                 let (mut n, mut acc) = (0usize, 0u64);
                 while p < d.len() {
-                    let (np, ok) = if mode >= 10 { split_at2::<7>(d, p, &mut f) } else { split_at::<7>(d, p, &mut f) };
+                    let (np, ok) = if mode >= 30 { split_at3::<7>(d, p, &mut f) } else if mode >= 10 { split_at2::<7>(d, p, &mut f) } else { split_at::<7>(d, p, &mut f) };
                     p = np;
                     n += 1;
                     if !ok { continue; }
@@ -995,7 +1010,7 @@ fn main() {
                 ck: WcSet::new(UB),
             };
             let t = Instant::now();
-            parse_events_chunk(&c, &ctx, &mut out);
+            parse_chunk(v4_mode(), &c, &ctx, &mut out);
             out.keys.finish();
             out.recs.finish();
             let e = t.elapsed();
@@ -1016,6 +1031,10 @@ fn main() {
     make_chunks(&ev_files, 0, target, &mut chunks);
     make_chunks(&ck_files, 1, target, &mut chunks);
     chunks.sort_by_key(|c| std::cmp::Reverse(c.end - c.start));
+    let v4 = v4_mode();
+    if verbose {
+        eprintln!("      P1 mask kernel: {v4}");
+    }
     let next = AtomicUsize::new(0);
     let pouts: Vec<ParseOut> = run_threads(nthreads, |_| {
         let mut out = ParseOut {
@@ -1029,11 +1048,7 @@ fn main() {
                 break;
             }
             let c = &chunks[i];
-            if c.kind == 0 {
-                parse_events_chunk(c, &ctx, &mut out);
-            } else {
-                parse_clicks_chunk(c, &ctx, &mut out);
-            }
+            parse_chunk(v4, c, &ctx, &mut out);
         }
         out.keys.finish();
         out.recs.finish();

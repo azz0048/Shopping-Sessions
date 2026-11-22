@@ -44,6 +44,10 @@ fn check<const N: usize>(seed: u64, iters: usize) {
         assert_eq!(np, q + 1);
         assert_eq!(ok1, ok2, "validity differs on {:?}", String::from_utf8_lossy(&data[p..q]));
         let mut f3: [&'static [u8]; N] = [&[]; N];
+        let (np4, ok4) = csv::split_at3::<N>(data, p, &mut f1);
+        assert_eq!(np4, q + 1);
+        assert_eq!(ok4, ok2, "split_at3 validity differs on {:?}", String::from_utf8_lossy(&data[p..q]));
+        if ok4 { assert_eq!(f1, f2, "split_at3 fields differ"); }
         let (np3, ok3) = csv::split_at2::<N>(data, p, &mut f3);
         assert_eq!(np3, q + 1);
         assert_eq!(ok3, ok2, "split_at2 validity differs on {:?}", String::from_utf8_lossy(&data[p..q]));

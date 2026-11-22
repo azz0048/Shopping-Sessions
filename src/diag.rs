@@ -220,6 +220,24 @@ pub fn diag_main() -> ! {
         let (_, l) = run_child(tag, &p20, &o, &envs);
         sum.push(l);
     }
+    // output equality across kernels: order-independent checksum of the SS_CSV dumps
+    if let Some(modes) = std::env::var("SS_DIAG_CMP").ok().or(Some("0,1,2".into())) {
+        let mut sums = Vec::new();
+        for m in modes.split(',') {
+            let csv = scratch.join(format!("csv{m}"));
+            let _ = run_child("cmp", &p20, &o, &[("SS_V4MODE", m), ("SS_CSV", csv.to_str().unwrap())]);
+            let mut acc = (0u64, 0u64);
+            for t in ["user_daily.csv", "campaign_daily.csv"] {
+                let text = std::fs::read(csv.join(t)).unwrap_or_default();
+                for line in text.split(|&b| b == b'\n') {
+                    acc.0 = acc.0.wrapping_add(crate::hash1(line));
+                    acc.1 += 1;
+                }
+            }
+            sums.push(format!("m{m}={:x}/{}", acc.0, acc.1));
+        }
+        sum.push(format!("csv sums: {}", sums.join(" ")));
+    }
     #[cfg(unix)]
     if std::env::var_os("SS_DIAG_FAULTS").is_some() {
         sum.push(fault_bench("anonTHP8", 1 << 30, true, nthreads));
