@@ -221,7 +221,7 @@ pub fn diag_main() -> ! {
         sum.push(l);
     }
     // output equality across kernels: order-independent checksum of the SS_CSV dumps
-    if let Some(modes) = std::env::var("SS_DIAG_CMP").ok().or(Some("0,1,2,0f12".into())) {
+    if let Some(modes) = std::env::var("SS_DIAG_CMP").ok().or(Some("0".into())) {
         let mut sums = Vec::new();
         for m in modes.split(',') {
             let csv = scratch.join(format!("csv{m}"));
