@@ -873,14 +873,48 @@ fn main() {
 
     let block: usize = std::env::var("SS_BLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(8192);
     init_arena(1 << 30, block);
-    #[cfg(windows)]
     if let Some(gb) = std::env::var("SS_PRETOUCH").ok().and_then(|v| v.parse::<usize>().ok()) {
-        // dev only: map + touch arena regions up front (Windows page faults are far costlier than Linux THP)
+        // dev/diag only: map + touch arena regions up front, so phase times exclude anon page faults
         let n = (gb << 30) / block;
         let v: Vec<(usize, u32)> = (0..n).map(|_| { let (p, id) = arena().alloc(); (p as usize, id) }).collect();
+        let vs = &v;
+        let next = AtomicUsize::new(0);
+        run_threads(nthreads, |_| loop {
+            let i = next.fetch_add(64, Relaxed);
+            if i >= vs.len() {
+                break;
+            }
+            for &(p, _) in &vs[i..(i + 64).min(vs.len())] {
+                for o in (0..block).step_by(4096) {
+                    unsafe { std::ptr::write_volatile((p + o) as *mut u8, 0) };
+                }
+            }
+        });
         arena().release(&v);
         arena_flush_tl();
         lap("pretouch");
+    }
+    if std::env::var_os("SS_PREFAULT").is_some() {
+        // dev/diag only: fault every input page in (parallel) so P1 excludes file-mapping faults
+        let pieces: Vec<(usize, usize)> = ev_files.iter().chain(ck_files.iter()).chain(lk_files.iter())
+            .flat_map(|d| (0..d.len()).step_by(1 << 22).map(move |o| (d.as_ptr() as usize + o, (d.len() - o).min(1 << 22))))
+            .collect();
+        let next = AtomicUsize::new(0);
+        run_threads(nthreads, |_| {
+            let mut acc = 0u8;
+            loop {
+                let i = next.fetch_add(1, Relaxed);
+                if i >= pieces.len() {
+                    break;
+                }
+                let (b, l) = pieces[i];
+                for o in (0..l).step_by(4096) {
+                    acc = acc.wrapping_add(unsafe { std::ptr::read_volatile((b + o) as *const u8) });
+                }
+            }
+            std::hint::black_box(acc);
+        });
+        lap("prefault inputs");
     }
 
     // L: links
