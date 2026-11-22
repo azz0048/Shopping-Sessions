@@ -1117,8 +1117,11 @@ fn main() {
     };
     let next = AtomicUsize::new(0);
     let order = lpt_order(|b| pouts.iter().map(|po| po.keys.len(b)).sum(), EB);
+    // keys are read in place from the bucket's blocks (no copy): a slot holds
+    // (slice index << 10 | offset) + 1; every block slice holds fewer than 1024 keys
+    debug_assert!(WcSet::<Key, 4>::cap() < 1024);
     run_threads(nthreads, |_| {
-        let mut keys: Vec<Key> = Vec::new();
+        let mut slices: Vec<*const Key> = Vec::new();
         let mut slots: Vec<u32> = Vec::new();
         loop {
             let i = next.fetch_add(1, Relaxed);
@@ -1126,11 +1129,16 @@ fn main() {
                 break;
             }
             let b = order[i];
-            keys.clear();
+            slices.clear();
+            let mut n = 0usize;
             for po in pouts.iter() {
-                po.keys.for_slices(b, |x| keys.extend_from_slice(x));
+                po.keys.for_slices(b, |x| {
+                    if !x.is_empty() {
+                        slices.push(x.as_ptr());
+                        n += x.len();
+                    }
+                });
             }
-            let n = keys.len();
             if n == 0 {
                 continue;
             }
@@ -1138,27 +1146,36 @@ fn main() {
             let mask = cap - 1;
             slots.clear();
             slots.resize(cap, 0);
-            for i in 0..n {
-                let r = unsafe { keys.get_unchecked(i) };
-                let mut s = (r.hk as usize) & mask;
-                loop {
-                    let v = unsafe { *slots.get_unchecked(s) };
-                    if v == 0 {
-                        slots[s] = i as u32 + 1;
-                        break;
+            let mut si = 0u32;
+            for po in pouts.iter() {
+                po.keys.for_slices(b, |x| {
+                    if x.is_empty() {
+                        return;
                     }
-                    let o = unsafe { keys.get_unchecked((v - 1) as usize) };
-                    if o.hk == r.hk {
-                        if r.ingest < o.ingest {
-                            mark(o.handle);
-                            slots[s] = i as u32 + 1;
-                        } else {
-                            mark(r.handle);
+                    for (off, r) in x.iter().enumerate() {
+                        let id = ((si << 10) | off as u32) + 1;
+                        let mut s = (r.hk as usize) & mask;
+                        loop {
+                            let v = unsafe { *slots.get_unchecked(s) };
+                            if v == 0 {
+                                unsafe { *slots.get_unchecked_mut(s) = id };
+                                break;
+                            }
+                            let o = unsafe { &*slices.get_unchecked(((v - 1) >> 10) as usize).add(((v - 1) & 1023) as usize) };
+                            if o.hk == r.hk {
+                                if r.ingest < o.ingest {
+                                    mark(o.handle);
+                                    unsafe { *slots.get_unchecked_mut(s) = id };
+                                } else {
+                                    mark(r.handle);
+                                }
+                                break;
+                            }
+                            s = (s + 1) & mask;
                         }
-                        break;
                     }
-                    s = (s + 1) & mask;
-                }
+                    si += 1;
+                });
             }
         }
     });
