@@ -21,6 +21,27 @@ pub struct PersonWork {
     pub assist: Vec<u32>,        // [day * ncamp + camp]: assisted sessions (dense, cache-resident)
     pub rows: Vec<URow>,
     pub namebuf: Vec<u8>,
+    pub stats: RowStats,
+}
+
+/// Column statistics gathered while rows are produced, so the Parquet writer needs fewer passes.
+#[derive(Clone, Copy)]
+pub struct RowStats {
+    pub name_bytes: usize, // sum of (4 + name length) over rows: the PLAIN user_id page size
+    pub day: (i32, i32),
+    pub sessions: (i32, i32),
+    pub events: (i32, i32),
+    pub rev: (u64, u64),
+}
+impl RowStats {
+    pub fn new() -> Self {
+        RowStats { name_bytes: 0, day: (i32::MAX, i32::MIN), sessions: (i32::MAX, i32::MIN), events: (i32::MAX, i32::MIN), rev: (u64::MAX, 0) }
+    }
+}
+#[inline(always)]
+fn mm(r: &mut (i32, i32), v: i32) {
+    r.0 = r.0.min(v);
+    r.1 = r.1.max(v);
 }
 
 pub struct DayAcc {
@@ -46,6 +67,12 @@ pub fn flush_day(w: &mut PersonWork, acc: &DayAcc, name: u64) {
         w.catsum[c as usize] = 0;
     }
     w.touched.clear();
+    let s = &mut w.stats;
+    s.name_bytes += 4 + (name & 0xFFFF) as usize;
+    mm(&mut s.day, acc.day as i32);
+    mm(&mut s.sessions, acc.sessions as i32);
+    mm(&mut s.events, acc.events as i32);
+    s.rev = (s.rev.0.min(acc.rev), s.rev.1.max(acc.rev));
     w.rows.push(URow { name, day: acc.day as i32, top, sessions: acc.sessions, events: acc.events, rev: acc.rev });
 }
 
@@ -158,19 +185,20 @@ pub fn process_person(ev: &[Ev], cs: &[Ck], name_ref: u64, w: &mut PersonWork, w
     w.active.clear();
 }
 
-pub fn write_user_daily(path: &Path, rows: &[URow], namebuf: &[u8], cats: &[&'static [u8]]) {
+pub fn write_user_daily(path: &Path, rows: &[URow], namebuf: &[u8], cats: &[&'static [u8]], st: &RowStats) {
     let nb: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(namebuf) };
     let mut w = pq::StreamWriter::create(path, rows.len()).expect("create user_daily");
-    w.col_str("user_id", |i| {
+    let some = !rows.is_empty();
+    w.col_str("user_id", some.then_some(st.name_bytes), |i| {
         let r = rows[i].name;
         &nb[(r >> 16) as usize..((r >> 16) + (r & 0xFFFF)) as usize]
     })
     .unwrap();
-    w.col_i32("day", true, |i| rows[i].day).unwrap();
-    w.col_i32("sessions", false, |i| rows[i].sessions as i32).unwrap();
-    w.col_i32("events", false, |i| rows[i].events as i32).unwrap();
-    if rows.iter().all(|r| r.rev <= i32::MAX as u64) {
-        w.col_i32("revenue_cents", false, |i| rows[i].rev as i32).unwrap();
+    w.col_i32("day", true, some.then_some(st.day), |i| rows[i].day).unwrap();
+    w.col_i32("sessions", false, some.then_some(st.sessions), |i| rows[i].sessions as i32).unwrap();
+    w.col_i32("events", false, some.then_some(st.events), |i| rows[i].events as i32).unwrap();
+    if !some || st.rev.1 <= i32::MAX as u64 {
+        w.col_i32("revenue_cents", false, some.then_some((st.rev.0 as i32, st.rev.1 as i32)), |i| rows[i].rev as i32).unwrap();
     } else {
         w.col_i64("revenue_cents", |i| rows[i].rev as i64).unwrap();
     }

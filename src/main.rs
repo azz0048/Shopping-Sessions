@@ -253,8 +253,6 @@ fn radix_ts(a: &mut Vec<EvP>, b: &mut Vec<EvP>) {
         a.sort_by_key(|e| e.ts); // stable
         return;
     }
-    b.clear();
-    b.resize(n, EvP::default());
     let mut cnt = [[0u32; 2048]; 3];
     for e in a.iter() {
         let t = e.ts;
@@ -262,6 +260,19 @@ fn radix_ts(a: &mut Vec<EvP>, b: &mut Vec<EvP>) {
         cnt[1][((t >> 11) & 2047) as usize] += 1;
         cnt[2][((t >> 22) & 2047) as usize] += 1;
     }
+    radix_ts_counted(a, b, &mut cnt);
+}
+
+/// LSD radix passes with the three digit histograms already counted (by the caller's fill pass).
+fn radix_ts_counted(a: &mut Vec<EvP>, b: &mut Vec<EvP>, cnt: &mut [[u32; 2048]; 3]) {
+    let n = a.len();
+    if n < 64 {
+        a.sort_by_key(|e| e.ts); // stable
+        return;
+    }
+    b.clear();
+    b.reserve(n);
+    unsafe { b.set_len(n) }; // fully overwritten by the first scatter
     for c in cnt.iter_mut() {
         let mut acc = 0u32;
         for x in c.iter_mut() {
@@ -1233,6 +1244,7 @@ fn main() {
             assist: vec![0; ncamp * ndays],
             rows: Vec::new(),
             namebuf: Vec::new(),
+            stats: RowStats::new(),
         };
         let mut sorted: Vec<Ev> = Vec::new();
         let mut pname: Vec<u64> = Vec::new();
@@ -1268,16 +1280,30 @@ fn main() {
             let np = base_slots + names_of[b].len();
             pcount.clear();
             pcount.resize(np, 0);
+            // one fill pass: copy out of the bucket blocks, person slot, slot counts and the three
+            // radix digit histograms together
             ra.clear();
-            for d in mouts.iter() {
-                d.0.for_slices(b, |x| ra.extend_from_slice(x));
+            ra.reserve(n);
+            let mut cnt = [[0u32; 2048]; 3];
+            unsafe {
+                let mut w = ra.as_mut_ptr();
+                for d in mouts.iter() {
+                    d.0.for_slices(b, |x| {
+                        for e in x {
+                            let s = e.pid >> UB_BITS;
+                            *pcount.get_unchecked_mut(s as usize) += 1;
+                            let t = e.ts;
+                            *cnt[0].get_unchecked_mut((t & 2047) as usize) += 1;
+                            *cnt[1].get_unchecked_mut(((t >> 11) & 2047) as usize) += 1;
+                            *cnt[2].get_unchecked_mut(((t >> 22) & 2047) as usize) += 1;
+                            w.write(Ev { ts: t, pc: e.pc, pid: s });
+                            w = w.add(1);
+                        }
+                    });
+                }
+                ra.set_len(n);
             }
-            for e in ra.iter_mut() {
-                let s = e.pid >> UB_BITS;
-                e.pid = s;
-                unsafe { *pcount.get_unchecked_mut(s as usize) += 1 };
-            }
-            radix_ts(&mut ra, &mut rb);
+            radix_ts_counted(&mut ra, &mut rb, &mut cnt);
             pstart.clear();
             let mut acc = 0u32;
             for &c in pcount.iter() {
@@ -1380,7 +1406,7 @@ fn main() {
         if verbose {
             eprintln!("          thread {t} rows {}", w.rows.len());
         }
-        write_user_daily(&out_dir.join("user_daily").join(format!("part-{t:03}.parquet")), &w.rows, &w.namebuf, &cats);
+        write_user_daily(&out_dir.join("user_daily").join(format!("part-{t:03}.parquet")), &w.rows, &w.namebuf, &cats, &w.stats);
         if verbose {
             eprintln!("          thread {t} parquet {:.0} ms", tw.elapsed().as_secs_f64() * 1e3);
         }

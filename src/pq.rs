@@ -375,6 +375,8 @@ struct SMeta {
     encoding: i32,
 }
 
+const STAGE: usize = 256 * 1024;
+
 pub struct StreamWriter {
     f: std::io::BufWriter<std::fs::File>,
     pos: i64,
@@ -445,7 +447,9 @@ fn bit_width(ndict: usize) -> u32 {
 
 impl StreamWriter {
     pub fn create(path: &std::path::Path, nrows: usize) -> std::io::Result<StreamWriter> {
-        let mut f = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?);
+        // bulk data goes out in stage-sized writes (> buffer capacity, so BufWriter passes them
+        // straight through without a second copy); only small headers are buffered
+        let mut f = std::io::BufWriter::with_capacity(1 << 16, std::fs::File::create(path)?);
         f.write_all(b"PAR1")?;
         Ok(StreamWriter { f, pos: 4, nrows, cols: Vec::new(), stage: Vec::with_capacity(1 << 16) })
     }
@@ -463,9 +467,9 @@ impl StreamWriter {
     }
 
     /// Required BYTE_ARRAY (UTF8), PLAIN.
-    pub fn col_str(&mut self, name: &str, get: impl Fn(usize) -> &'static [u8]) -> std::io::Result<()> {
+    pub fn col_str(&mut self, name: &str, body: Option<usize>, get: impl Fn(usize) -> &'static [u8]) -> std::io::Result<()> {
         let n = self.nrows;
-        let body: usize = (0..n).map(|i| get(i).len() + 4).sum();
+        let body: usize = body.unwrap_or_else(|| (0..n).map(|i| get(i).len() + 4).sum());
         let start = self.pos;
         let h = page_header(0, body, n, PLAIN);
         self.put(&h)?;
@@ -474,7 +478,7 @@ impl StreamWriter {
             let s = get(i);
             self.stage.extend_from_slice(&(s.len() as u32).to_le_bytes());
             push_small(&mut self.stage, s);
-            if self.stage.len() >= 60_000 {
+            if self.stage.len() >= STAGE {
                 self.drain_stage()?;
             }
         }
@@ -484,16 +488,21 @@ impl StreamWriter {
     }
 
     /// Required INT32 (optionally DATE): dictionary-encoded when the value range is small.
-    pub fn col_i32(&mut self, name: &str, date: bool, get: impl Fn(usize) -> i32) -> std::io::Result<()> {
+    /// range: the exact (min, max) of the values when the caller already knows it (saves a pass).
+    pub fn col_i32(&mut self, name: &str, date: bool, range: Option<(i32, i32)>, get: impl Fn(usize) -> i32) -> std::io::Result<()> {
         let n = self.nrows;
         let start = self.pos;
         let logical = if date { 2 } else { 0 };
-        let (mut mn, mut mx) = (i32::MAX, i32::MIN);
-        for i in 0..n {
-            let v = get(i);
-            mn = mn.min(v);
-            mx = mx.max(v);
-        }
+        let (mn, mx) = range.unwrap_or_else(|| {
+            let (mut mn, mut mx) = (i32::MAX, i32::MIN);
+            for i in 0..n {
+                let v = get(i);
+                mn = mn.min(v);
+                mx = mx.max(v);
+            }
+            (mn, mx)
+        });
+        debug_assert!(n == 0 || (0..n).all(|i| (mn..=mx).contains(&get(i))));
         let range = if n == 0 { 0 } else { (mx as i64 - mn as i64 + 1) as usize };
         if n > 0 && range <= 1 << 16 {
             // dictionary in first-seen order
@@ -529,7 +538,7 @@ impl StreamWriter {
             for i in 0..n {
                 let v = get(i);
                 bp.put(map[(v - mn) as usize], bw, &mut self.stage);
-                if self.stage.len() >= 60_000 {
+                if self.stage.len() >= STAGE {
                     self.drain_stage()?;
                 }
             }
@@ -545,7 +554,7 @@ impl StreamWriter {
             self.put(&h)?;
             for i in 0..n {
                 self.stage.extend_from_slice(&get(i).to_le_bytes());
-                if self.stage.len() >= 60_000 {
+                if self.stage.len() >= STAGE {
                     self.drain_stage()?;
                 }
             }
@@ -563,7 +572,7 @@ impl StreamWriter {
         self.put(&h)?;
         for i in 0..n {
             self.stage.extend_from_slice(&get(i).to_le_bytes());
-            if self.stage.len() >= 60_000 {
+            if self.stage.len() >= STAGE {
                 self.drain_stage()?;
             }
         }
@@ -620,7 +629,7 @@ impl StreamWriter {
         let mut bp = BitPacker { acc: 0, nbits: 0 };
         for i in 0..n {
             bp.put(get(i).is_some() as u32, 1, &mut self.stage);
-            if self.stage.len() >= 60_000 {
+            if self.stage.len() >= STAGE {
                 self.drain_stage()?;
             }
         }
@@ -633,7 +642,7 @@ impl StreamWriter {
         for i in 0..n {
             if let Some(v) = get(i) {
                 bp.put(map[v as usize], bw, &mut self.stage);
-                if self.stage.len() >= 60_000 {
+                if self.stage.len() >= STAGE {
                     self.drain_stage()?;
                 }
             }
