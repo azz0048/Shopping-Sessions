@@ -28,7 +28,7 @@ pub fn diag_main() -> ! {
             (tag.trim().to_string(), envs)
         })
         .collect();
-    let rounds: usize = 5;
+    let rounds: usize = 16;
     let mut times: Vec<Vec<f64>> = vec![Vec::new(); runs.len()];
     let mut bad: Vec<usize> = vec![0; runs.len()];
     let mut rows: Vec<String> = vec![String::new(); runs.len()];
@@ -71,11 +71,14 @@ pub fn diag_main() -> ! {
             }
         }
     }
-    eprintln!("==== DIAG4 (gen {gen_s:.1}s) median/min ms over {rounds} ====");
+    eprintln!("==== DIAG5 (gen {gen_s:.1}s) ms over {rounds} ====");
     for (i, (tag, _)) in runs.iter().enumerate() {
         let mut v = times[i].clone();
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        eprintln!("{tag:>9} {:6.1} {:6.1}{} {}", v[v.len() / 2], v[0], if bad[i] > 0 { format!(" FAIL{}", bad[i]) } else { String::new() }, rows[i]);
+        let mean = v.iter().sum::<f64>() / v.len() as f64;
+        let q1 = v[v.len() / 4];
+        let q3 = v[3 * v.len() / 4];
+        eprintln!("{tag:>9} med {:6.1} min {:6.1} mean {mean:6.1} q1 {q1:6.1} q3 {q3:6.1}{} {}", v[v.len() / 2], v[0], if bad[i] > 0 { format!(" FAIL{}", bad[i]) } else { String::new() }, rows[i]);
     }
     eprintln!("total {:.1} s", t0.elapsed().as_secs_f64());
     std::process::exit(1);
