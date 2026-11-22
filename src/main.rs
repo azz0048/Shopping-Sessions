@@ -340,7 +340,7 @@ fn parse_events_chunk(c: &Chunk, ctx: &Ctx, out: &mut ParseOut) {
         }
         let (h1, h2) = hash_wide(eid);
         let hk = (h1 & ((1u64 << 54) - 1)) | (((h2 & 0x3FF) as u64) << 54);
-        let ingest = parse_ts_fast(f[3]).unwrap_or(i64::MAX);
+        let ingest = parse_ingest(f[3]).unwrap_or(i64::MAX);
         let ing_rel = ((ingest.saturating_sub(ws)) / 1000).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
         // validity of this copy
         let handle = 'v: {
@@ -526,10 +526,14 @@ fn uf_union(parent: &[AtomicU32], a: u32, b: u32) {
 /// byte-wise order on the full strings.
 #[inline(always)]
 fn be_prefix(s: &[u8]) -> u64 {
-    let mut b = [0u8; 8];
-    let n = s.len().min(8);
-    b[..n].copy_from_slice(&s[..n]);
-    u64::from_be_bytes(b)
+    if s.len() >= 8 {
+        return u64::from_be_bytes(s[..8].try_into().unwrap());
+    }
+    let mut v = 0u64;
+    for (i, &c) in s.iter().enumerate() {
+        v |= (c as u64) << (56 - 8 * i);
+    }
+    v
 }
 
 fn find(parent: &mut [u32], mut x: u32) -> u32 {
@@ -1085,10 +1089,9 @@ fn main() {
         let mut pmap = SmallMap::new(0);
         let mut nmap = SmallMap::new(0);
         let (mut tgroup, mut tproc) = (0f64, 0f64);
-        let (mut pcount, mut pid, mut pstart, mut pfill, mut cpid, mut ccount, mut cstart): (
-            Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>,
+        let (mut pcount, mut pstart, mut pfill, mut cpid, mut ccount, mut cstart): (
+            Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>,
         ) = Default::default();
-        pid.reserve(maxn);
         cpid.reserve(maxc);
         loop {
             let i = next.fetch_add(1, Relaxed);
@@ -1104,7 +1107,6 @@ fn main() {
             // group by person: hash -> local id, counting sort, then sort each person's events by ts
             pmap.reset(n / 16);
             pcount.clear();
-            pid.clear();
             pperson.clear();
             ra.clear();
             for d in mouts.iter() {
@@ -1117,7 +1119,6 @@ fn main() {
                             pperson.push(e.person);
                         }
                         pcount[id as usize] += 1;
-                        pid.push(id);
                         ra.push(EvP { ts: e.ts, pc: e.pc, pid: id });
                     }
                 });

@@ -264,12 +264,26 @@ pub fn parse_ts_fast(s: &[u8]) -> Option<i64> {
     parse_ts_slow_f3(s)
 }
 
+const POW10: [u64; 9] = [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000];
+
 /// F3 (digits only) or invalid.
 #[inline(always)]
 fn parse_ts_slow_f3(s: &[u8]) -> Option<i64> {
     let n = s.len();
     if n == 0 {
         return None;
+    }
+    if n >= 8 && n <= 16 {
+        // two overlapping 8-byte loads straight from the input (no stack buffer, so no
+        // store-forwarding stall); bytes of the second word already covered by the first become '0'
+        let a = u64::from_le_bytes(s[0..8].try_into().unwrap()) ^ 0x3030_3030_3030_3030;
+        let w = u64::from_le_bytes(s[n - 8..n].try_into().unwrap());
+        let keep = if n == 8 { 0 } else { u64::MAX << (8 * (16 - n)) };
+        let b = (w & keep) ^ 0x3030_3030_3030_3030 ^ (0x3030_3030_3030_3030 & !keep);
+        if ((a.wrapping_add(0x7676_7676_7676_7676) | a) | (b.wrapping_add(0x7676_7676_7676_7676) | b)) & 0x8080_8080_8080_8080 != 0 {
+            return None;
+        }
+        return Some((parse8(a) * POW10[n - 8] + parse8(b)) as i64);
     }
     if n <= 16 {
         // right-align into 16 bytes padded with '0', validate all digits, convert 8 at a time
@@ -298,4 +312,27 @@ fn parse_ts_slow_f3(s: &[u8]) -> Option<i64> {
         return Some(i64::MAX);
     }
     Some(v as i64)
+}
+
+/// ingest_ts is always valid F1 (rules.md): fast path without digit/range validation.
+/// Separators are still checked; anything else falls back to the full parser.
+#[cfg_attr(not(feature = "prof"), inline(always))]
+#[cfg_attr(feature = "prof", inline(never))]
+pub fn parse_ingest(s: &[u8]) -> Option<i64> {
+    if s.len() == 20 {
+        let a = u64::from_le_bytes(s[0..8].try_into().unwrap());
+        let b = u64::from_le_bytes(s[8..16].try_into().unwrap());
+        let c = u32::from_le_bytes(s[16..20].try_into().unwrap()) as u64;
+        if (a & SEP_A_MASK) == SEP_A && (b & SEP_B_MASK) == SEP_B && (c & 0xFF_0000_FF) == ((b'Z' as u64) << 24 | b':' as u64) {
+            let pa = pairs((a ^ 0x3030_3030_3030_3030) & DIG_A);
+            let pb = pairs((b ^ 0x3030_3030_3030_3030) & DIG_B);
+            let pc = pairs((c ^ 0x3030_3030) & 0x00FF_FF00);
+            let y = byte(pa, 0) * 100 + byte(pa, 2);
+            let mo = byte(pa, 5);
+            if mo.wrapping_sub(1) as u64 <= 11 {
+                return Some(month_start_ms(y, mo) + (byte(pb, 0) - 1) * 86_400_000 + byte(pb, 3) * 3_600_000 + byte(pb, 6) * 60_000 + byte(pc, 1) * 1000);
+            }
+        }
+    }
+    parse_ts_fast(s)
 }

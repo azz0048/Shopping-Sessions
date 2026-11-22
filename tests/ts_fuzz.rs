@@ -39,6 +39,9 @@ fn fuzz() {
         for m in 0..=13 { for d in 0..=32 {
             let s = format!("{y:04}-{m:02}-{d:02}T10:20:30Z");
             assert_eq!(parse_ts(s.as_bytes()), parse_ts_fast(s.as_bytes()), "{s}");
+            if parse_ts(s.as_bytes()).is_some() {
+                assert_eq!(parse_ts(s.as_bytes()), parse_ingest(s.as_bytes()), "ingest {s}");
+            }
         }}
     }
     eprintln!("{n} ok");
