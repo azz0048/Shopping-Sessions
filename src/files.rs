@@ -26,6 +26,7 @@ pub fn map_file(p: &Path) -> &'static [u8] {
     }
     let m = unsafe { memmap2::Mmap::map(&f).expect("mmap") };
     let m: &'static memmap2::Mmap = Box::leak(Box::new(m));
+    register_region(m.as_ptr() as usize, m.len());
     #[cfg(windows)]
     if std::env::var_os("SS_PRETOUCH").is_some() {
         // dev only: fault the mapping in up front so phase timings show compute, not page faults

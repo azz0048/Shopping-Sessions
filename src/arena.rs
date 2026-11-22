@@ -45,6 +45,52 @@ fn map_region(size: usize) -> usize {
 
 pub const HUGE: usize = 2 << 20;
 
+/// Every big mapping (input files, arena regions, link arrays), so they can be unmapped in
+/// parallel right before exit instead of by the kernel's single-threaded exit_mmap.
+static REGIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+pub fn register_region(addr: usize, len: usize) {
+    if len > 0 {
+        REGIONS.lock().unwrap().push((addr, len));
+    }
+}
+
+/// Unmap all registered regions with `nthreads` threads (pieces of at most 64 MB). Only call
+/// when nothing will touch that memory again (all output written, about to exit).
+pub fn teardown_parallel(nthreads: usize) {
+    #[cfg(unix)]
+    {
+        const PIECE: usize = 64 << 20;
+        let regions = std::mem::take(&mut *REGIONS.lock().unwrap());
+        let mut pieces: Vec<(usize, usize)> = Vec::new();
+        for (a, len) in regions {
+            let end = a + len;
+            let mut p = a;
+            while p < end {
+                let q = (p + PIECE).min(end);
+                pieces.push((p, q - p));
+                p = q;
+            }
+        }
+        pieces.sort_by_key(|x| std::cmp::Reverse(x.1));
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..nthreads {
+                s.spawn(|| loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= pieces.len() {
+                        break;
+                    }
+                    let (p, l) = pieces[i];
+                    unsafe { libc::munmap(p as *mut libc::c_void, l) };
+                });
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    let _ = nthreads;
+}
+
 /// Anonymous, THP-advised, 2 MB-aligned mapping.
 #[cfg(unix)]
 fn map_region(size: usize) -> usize {
@@ -60,6 +106,7 @@ fn map_region(size: usize) -> usize {
         assert!(p != libc::MAP_FAILED, "arena mmap failed");
         let a = (p as usize + HUGE - 1) & !(HUGE - 1);
         libc::madvise(a as *mut libc::c_void, size, libc::MADV_HUGEPAGE);
+        register_region(a, size);
         a
     }
 }

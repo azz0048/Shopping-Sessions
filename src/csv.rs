@@ -455,7 +455,8 @@ pub fn chunk_start(data: &'static [u8], start: usize, end: usize) -> usize {
 
 /// Pre-populate page tables for data[start..end] in one syscall (Linux 5.14+; errors ignored).
 pub fn populate(data: &'static [u8], start: usize, end: usize) {
-    if std::env::var_os("SS_POP").is_none() {
+    static POP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*POP.get_or_init(|| std::env::var_os("SS_POP").is_some()) {
         return;
     }
     let a = (data.as_ptr() as usize + start) & !4095;

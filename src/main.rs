@@ -1071,7 +1071,8 @@ fn main() {
     // P1: parse events + clicks
     let etotal: usize = ev_files.iter().map(|d| d.len()).sum();
     let ctotal: usize = ck_files.iter().map(|d| d.len()).sum();
-    let target = ((etotal + ctotal) / (nthreads * 24)).clamp(1 << 18, 16 << 20);
+    // small chunks (largest first) keep the end of P1 balanced across threads
+    let target = ((etotal + ctotal) / (nthreads * 64)).clamp(1 << 18, 4 << 20);
     let mut chunks = Vec::new();
     make_chunks(&ev_files, 0, target, &mut chunks);
     make_chunks(&ck_files, 1, target, &mut chunks);
@@ -1484,6 +1485,12 @@ fn main() {
     if verbose {
         let urows: usize = works.iter().map(|w| w.rows.len()).sum();
         eprintln!("user rows {urows}, campaign rows {}", crow.len());
+    }
+    // all output is written: unmap inputs and work memory on all threads (the kernel would
+    // otherwise do it single-threaded in exit_mmap, inside the timed run)
+    if std::env::var_os("SS_NOTEARDOWN").is_none() {
+        teardown_parallel(nthreads);
+        lap("teardown");
     }
     std::process::exit(0);
 }
