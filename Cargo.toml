@@ -1,15 +1,22 @@
 [package]
-name = "ss"
+name = "pipeline"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "pipeline"
+path = "src/main.rs"
 
 [features]
-prof = []
+stats = []
+knobs = []
+testkeys = []
+pmu = []
+tl = []
+sp = []
 
 [dependencies]
-libc = "0.2.191"
-memchr = "2.8.3"
-memmap2 = "0.9.12"
 
 [profile.release]
 opt-level = 3
@@ -17,4 +24,3 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 debug = false
-strip = true
