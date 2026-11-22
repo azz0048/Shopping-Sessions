@@ -1370,26 +1370,43 @@ fn main() {
             }
             let tg = Instant::now();
             tgroup += (tg - tb).as_secs_f64();
-            // resolve all names first and prefetch them, so the copies in process_person hit cache
-            pname.clear();
+            // persons of this bucket; their names are resolved in a two-stage software pipeline
+            // (prefetch the dref entry D1 persons ahead, then load it and prefetch the name string
+            // D2 ahead), so the name copy in process_person rarely misses cache
             plist.clear();
             for s in 0..np {
-                if pcount[s] == 0 {
-                    continue;
+                if pcount[s] != 0 {
+                    plist.push(s as u32);
                 }
-                let r = if s < base_slots {
-                    links.dref[(s << UB_BITS) | b]
-                } else {
-                    names_of[b][s - base_slots]
-                };
-                unsafe {
-                    std::arch::x86_64::_mm_prefetch((r & ((1u64 << 47) - 1)) as *const i8, std::arch::x86_64::_MM_HINT_T0)
-                };
-                pname.push(r);
-                plist.push(s as u32);
             }
-            for (k, &s) in plist.iter().enumerate() {
-                let s = s as usize;
+            let m = plist.len();
+            pname.clear();
+            pname.resize(m, 0);
+            const D1: usize = 32;
+            const D2: usize = 12;
+            let names_b = &names_of[b];
+            let ref_ptr = |s: usize| -> *const u64 {
+                if s < base_slots { unsafe { links.dref.as_ptr().add((s << UB_BITS) | b) } } else { unsafe { names_b.as_ptr().add(s - base_slots) } }
+            };
+            let pf = |p: *const u8| unsafe { std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0) };
+            for j in 0..m.min(D1) {
+                pf(ref_ptr(plist[j] as usize) as *const u8);
+            }
+            for j in 0..m.min(D2) {
+                let r = unsafe { *ref_ptr(plist[j] as usize) };
+                pname[j] = r;
+                pf((r & PTR_MASK) as *const u8);
+            }
+            for k in 0..m {
+                if k + D1 < m {
+                    pf(ref_ptr(plist[k + D1] as usize) as *const u8);
+                }
+                if k + D2 < m {
+                    let r = unsafe { *ref_ptr(plist[k + D2] as usize) };
+                    pname[k + D2] = r;
+                    pf((r & PTR_MASK) as *const u8);
+                }
+                let s = plist[k] as usize;
                 let ev = &mut sorted[pstart[s] as usize..pstart[s + 1] as usize];
                 debug_assert!(ev.windows(2).all(|w| w[0].ts <= w[1].ts));
                 let cs = &mut csorted[cstart[s] as usize..cstart[s + 1] as usize];
