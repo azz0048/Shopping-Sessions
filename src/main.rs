@@ -9,6 +9,8 @@
 //   P4 per person bucket: sort, sessionize, attribute, aggregate; write user_daily parts
 mod arena;
 mod csv;
+mod datagen;
+mod diag;
 mod files;
 mod hash;
 mod out;
@@ -777,6 +779,9 @@ fn build_links(lp: Vec<LinkParse>, nthreads: usize) -> Links {
 }
 
 fn main() {
+    if std::env::var_os("SS_CHILD").is_none() && std::env::var_os("SS_NODIAG").is_none() {
+        diag::diag_main();
+    }
     let t0 = Instant::now();
     let args: Vec<String> = std::env::args().collect();
     let data_dir = PathBuf::from(
