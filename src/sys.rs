@@ -265,7 +265,20 @@ struct ExecInfo {
     data: String,
     out: String,
     ncpu: usize,
-}  
+    // Re-exec into the key-free v3b fast path: original argv, environ + XL_V3=1.
+    _v3_args: Vec<CString>,
+    v3_ptrs: Vec<*const c_char>,
+    _v3_env: Vec<CString>,
+    v3_envp: Vec<*const c_char>,
+    // Re-exec with the run-contiguity precheck on: environ + XL_PRECHECK=1.
+    _pc_env: Vec<CString>,
+    pc_envp: Vec<*const c_char>,
+}
+
+/// Set once the v2b (keyed, event-bucket) fast path has been chosen. Its
+/// fallbacks are about v2b's own data-layout assumptions, so they retry in
+/// v3b first; anything v3b cannot do still ends in the generic pipeline.
+pub static V2B_ACTIVE: AtomicBool = AtomicBool::new(false);  
 static mut EXEC: Option<ExecInfo> = None;
 
 pub fn exec_init(args: &[String], data: &str, out: &str, ncpu: usize) {
@@ -278,8 +291,28 @@ pub fn exec_init(args: &[String], data: &str, out: &str, ncpu: usize) {
     }
     let mut ptrs: Vec<*const c_char> = a.iter().map(|c| c.as_ptr()).collect();
     ptrs.push(std::ptr::null());
+    let v3_args: Vec<CString> = args.iter().map(|s| cs(s)).collect();
+    let mut v3_ptrs: Vec<*const c_char> = v3_args.iter().map(|c| c.as_ptr()).collect();
+    v3_ptrs.push(std::ptr::null());
+    let mut v3_env: Vec<CString> = std::env::vars_os()
+        .filter(|(k, _)| k != "XL_V3")
+        .filter_map(|(k, v)| {
+            let mut b = k.into_encoded_bytes();
+            b.push(b'=');
+            b.extend_from_slice(v.as_encoded_bytes());
+            CString::new(b).ok()
+        })
+        .collect();
+    let mut pc_env: Vec<CString> = v3_env.clone();
+    pc_env.retain(|c| !c.as_bytes().starts_with(b"XL_PRECHECK="));
+    pc_env.push(cs("XL_PRECHECK=1"));
+    let mut pc_envp: Vec<*const c_char> = pc_env.iter().map(|c| c.as_ptr()).collect();
+    pc_envp.push(std::ptr::null());
+    v3_env.push(cs("XL_V3=1"));
+    let mut v3_envp: Vec<*const c_char> = v3_env.iter().map(|c| c.as_ptr()).collect();
+    v3_envp.push(std::ptr::null());
     unsafe {
-        EXEC = Some(ExecInfo { argv0, _args: a, ptrs, data: data.to_string(), out: out.to_string(), ncpu });
+        EXEC = Some(ExecInfo { argv0, _args: a, ptrs, data: data.to_string(), out: out.to_string(), ncpu, _v3_args: v3_args, v3_ptrs, _v3_env: v3_env, v3_envp, _pc_env: pc_env, pc_envp });
     }
 }  
 
@@ -290,6 +323,17 @@ pub fn fallback(why: &str) -> ! {
     unsafe {
         #[allow(static_mut_refs)]
         if let Some(e) = EXEC.as_ref() {
+            let v2b = V2B_ACTIVE.load(Ordering::SeqCst) && !std::env::var("XL_V3").is_ok_and(|v| v == "1");
+            if v2b && why == "a user has two runs" && !std::env::var("XL_PRECHECK").is_ok_and(|v| v == "1") {
+                eprintln!("[v2b] retrying with the run precheck");
+                execve(c"/proc/self/exe".as_ptr(), e.v3_ptrs.as_ptr(), e.pc_envp.as_ptr());
+                execve(e.argv0.as_ptr(), e.v3_ptrs.as_ptr(), e.pc_envp.as_ptr());
+            }
+            if v2b {
+                eprintln!("[v2b] retrying in v3b");
+                execve(c"/proc/self/exe".as_ptr(), e.v3_ptrs.as_ptr(), e.v3_envp.as_ptr());
+                execve(e.argv0.as_ptr(), e.v3_ptrs.as_ptr(), e.v3_envp.as_ptr());
+            }
             execve(c"/proc/self/exe".as_ptr(), e.ptrs.as_ptr(), environ);
             execve(e.argv0.as_ptr(), e.ptrs.as_ptr(), environ);
             eprintln!("[v2b] exec failed");

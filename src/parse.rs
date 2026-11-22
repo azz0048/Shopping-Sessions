@@ -672,6 +672,30 @@ impl EvPart {
             }
         }
     }
+    /// Like `for_each_esc`, but hands out raw chunk pointers (no shared
+    /// references), so callers may write to the records in place.
+    pub fn for_each_esc_raw(&self, b: usize, mut f: impl FnMut(*mut Rec, usize)) {
+        unsafe {
+            if !R12 || b >= self.esc_head.len() {
+                return;
+            }
+            let mut c = self.esc_head[b];
+            if c.is_null() {
+                return;
+            }
+            let cur = self.esc_cur[b] as usize;
+            let last = (cur - 1) & !(ESC_CHUNK - 1);
+            loop {
+                if c as usize == last {
+                    f(c as *mut Rec, (cur - last) / 16);
+                    break;
+                }
+                let next = *(c.add(ESC_LINK) as *const usize) as *mut u8;
+                f(c as *mut Rec, ESC_LINK / 16);
+                c = next;
+            }
+        }
+    }
     pub fn for_each_rec(&self, b: usize, mut f: impl FnMut(Rec)) {
         self.for_each_raw(b, |p, n| {
             for i in 0..n {

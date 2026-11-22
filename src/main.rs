@@ -10,6 +10,7 @@ mod links;
 mod out;
 mod parse;
 mod pqw;
+mod precheck;
 mod setup;
 mod sys;
 mod v3b;
@@ -289,7 +290,59 @@ pub fn shard(pkey: u64) -> usize {
     (pkey.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize
 }  
 
+/// True when the CPU and OS support everything `-C target-cpu=cascadelake`
+/// lets the compiler use. Raw cpuid on purpose: `is_x86_feature_detected!`
+/// folds to `true` for features enabled at compile time.
+#[inline(never)]
+fn cpu_ok() -> bool {
+    use std::arch::x86_64::{__cpuid, __cpuid_count};
+    let bit = |r: u32, b: u32| r >> b & 1 == 1;
+    unsafe {
+        if __cpuid(0).eax < 7 || __cpuid(0x8000_0000).eax < 0x8000_0001 {
+            return false;
+        }
+        let l1 = __cpuid(1);
+        let l7 = __cpuid_count(7, 0);
+        let ex = __cpuid(0x8000_0001);
+        let c1 = [0, 1, 9, 12, 13, 19, 20, 22, 23, 25, 26, 27, 28, 29, 30].iter().all(|&b| bit(l1.ecx, b));
+        let b7 = [3, 5, 8, 16, 17, 18, 19, 28, 30, 31].iter().all(|&b| bit(l7.ebx, b));
+        if !(c1 && b7 && bit(l7.ecx, 11) && bit(ex.ecx, 5)) {
+            return false;
+        }
+        let (lo, _hi): (u32, u32);
+        std::arch::asm!("xgetbv", in("ecx") 0u32, out("eax") lo, out("edx") _hi, options(nomem, nostack));
+        lo & 0xE6 == 0xE6 // SSE, AVX, opmask and both ZMM state components enabled by the OS
+    }
+}
+
+/// On a CPU without AVX-512, hand over to the baseline `pipeline-portable`
+/// binary next to this one (generic pipeline, no AVX at all).
+#[cold]
+#[inline(never)]
+fn portable_or_continue() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let force = std::env::var_os("XL_FORCE_PORTABLE").is_some_and(|v| v == "1");
+    if !force && cpu_ok() {
+        return;
+    }
+    eprintln!("[v2b] CPU lacks AVX-512 (or forced): switching to pipeline-portable");
+    let Ok(me) = std::fs::read_link("/proc/self/exe") else { return };
+    let p = me.with_file_name("pipeline-portable");
+    let Ok(path) = CString::new(p.as_os_str().as_bytes()) else { return };
+    let args: Vec<CString> = std::env::args_os().filter_map(|a| CString::new(a.as_bytes()).ok()).collect();
+    let mut ptrs: Vec<*const std::ffi::c_char> = args.iter().map(|a| a.as_ptr()).collect();
+    ptrs.push(std::ptr::null());
+    extern "C" {
+        static environ: *const *const std::ffi::c_char;
+        fn execve(p: *const std::ffi::c_char, a: *const *const std::ffi::c_char, e: *const *const std::ffi::c_char) -> i32;
+    }
+    unsafe { execve(path.as_ptr(), ptrs.as_ptr(), environ) };
+    eprintln!("[v2b] could not exec {}; continuing", p.display());
+}
+
 fn main() {
+    portable_or_continue();
     sys::xm(1);
     let t0 = Instant::now();
     #[cfg(feature = "sp")]
@@ -411,6 +464,9 @@ fn main() {
     let g: &'static mut G = Box::leak(Box::new(setup::setup(&data, nt, check)));
     sys::xm(10);
     lap("setup");
+    if !v3b::ON.load(std::sync::atomic::Ordering::SeqCst) {
+        sys::V2B_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     if v3b::ON.load(std::sync::atomic::Ordering::SeqCst) {
         v3b::run(g, &outdir, timing || check);
         if timing {
