@@ -344,6 +344,7 @@ impl<T: Copy> BucketSet<T> {
 pub struct WcSet<T: Copy, const K: usize> {
     hot: Vec<(*mut T, *mut T)>, // (cur, end) in block memory
     cnt: Vec<u8>,
+    nexth: Vec<u32>, // push_h: handle of the next element (block id * cap + index)
     buf: Vec<Stage<T, K>>,
     cold: Vec<Cold<T>>,
 }
@@ -363,6 +364,7 @@ impl<T: Copy, const K: usize> WcSet<T, K> {
         WcSet {
             hot: vec![(std::ptr::null_mut(), std::ptr::null_mut()); n],
             cnt: vec![0; n],
+            nexth: vec![0; n],
             buf: vec![Stage(unsafe { std::mem::zeroed() }); n],
             cold: (0..n).map(|_| Cold { start: std::ptr::null_mut(), id: 0, blocks: Vec::new() }).collect(),
         }
@@ -393,9 +395,9 @@ impl<T: Copy, const K: usize> WcSet<T, K> {
                     self.grow(b);
                 }
             }
-            let cold = self.cold.get_unchecked(b);
-            let h = self.hot.get_unchecked(b);
-            let handle = cold.id * Self::cap() as u32 + h.0.offset_from(cold.start) as u32 + c as u32;
+            let nh = self.nexth.get_unchecked_mut(b);
+            let handle = *nh;
+            *nh = handle + 1;
             *self.buf.get_unchecked_mut(b).0.get_unchecked_mut(c) = v;
             if c + 1 == K {
                 self.flush(b);
@@ -438,6 +440,7 @@ impl<T: Copy, const K: usize> WcSet<T, K> {
         c.start = p;
         c.id = id;
         *h = (p, unsafe { p.add(Self::cap()) });
+        self.nexth[b] = id * Self::cap() as u32;
     }
     /// Write out partially filled stage buffers and fence the non-temporal stores.
     pub fn finish(&mut self) {
