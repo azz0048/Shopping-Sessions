@@ -35,6 +35,8 @@ pub const DAY: i64 = 86_400_000;
 pub const GAP: i64 = 1_800_000;
 pub const WEEK: i64 = 604_800_000;
 pub const LATE: i64 = 86_400_000;
+/// Threads building links in the background during P1/P2 (0 = build them up front).
+pub const LINKS_OVERLAP_DEFAULT: usize = 0;
 
 const EB_BITS: u32 = 10; // event-id buckets
 const EB: usize = 1 << EB_BITS;
@@ -971,28 +973,51 @@ fn main() {
     }
 
     // L: links
-    let mut lchunks = Vec::new();
-    let ltotal: usize = lk_files.iter().map(|d| d.len()).sum();
-    make_chunks(&lk_files, 2, (ltotal / (nthreads * 4)).clamp(1 << 16, 8 << 20), &mut lchunks);
-    let next = AtomicUsize::new(0);
-    let lp: Vec<LinkParse> = run_threads(nthreads, |_| {
-        let mut out = LinkParse { sides: WcSet::new(UB), npairs: 0 };
-        loop {
-            let i = next.fetch_add(1, Relaxed);
-            if i >= lchunks.len() {
-                break;
+    let lk_static: &'static [&'static [u8]] = Box::leak(lk_files.clone().into_boxed_slice());
+    let do_links = move |lthreads: usize| -> Links {
+        let mut lchunks = Vec::new();
+        let ltotal: usize = lk_static.iter().map(|d| d.len()).sum();
+        make_chunks(lk_static, 2, (ltotal / (lthreads * 4)).clamp(1 << 16, 8 << 20), &mut lchunks);
+        let next = AtomicUsize::new(0);
+        let lp: Vec<LinkParse> = run_threads(lthreads, |_| {
+            let mut out = LinkParse { sides: WcSet::new(UB), npairs: 0 };
+            loop {
+                let i = next.fetch_add(1, Relaxed);
+                if i >= lchunks.len() {
+                    break;
+                }
+                parse_links_chunk(&lchunks[i], &mut out);
             }
-            parse_links_chunk(&lchunks[i], &mut out);
+            out.sides.finish();
+            out
+        });
+        build_links(lp, lthreads)
+    };
+    // Links are first needed in P3. With SS_LINKS_OVERLAP=<threads> they are built in the
+    // background while P1/P2 run (memory-latency-bound link work next to port-bound parsing).
+    let overlap: usize = std::env::var("SS_LINKS_OVERLAP").ok().and_then(|v| v.parse().ok()).unwrap_or(LINKS_OVERLAP_DEFAULT);
+    let mut links_bg: Option<std::thread::JoinHandle<Links>> = None;
+    let mut links_fg: Option<Links> = None;
+    if overlap > 0 {
+        links_bg = Some(std::thread::spawn(move || {
+            let l = do_links(overlap);
+            arena_flush_tl();
+            l
+        }));
+    } else {
+        links_fg = Some(do_links(nthreads));
+        lap("links built");
+    }
+    let mut get_links = move || -> Links {
+        match links_bg.take() {
+            Some(h) => h.join().unwrap(),
+            None => links_fg.take().unwrap(),
         }
-        out.sides.finish();
-        out
-    });
-    lap("links parsed");
-    let links = build_links(lp, nthreads);
-    lap("links built");
+    };
 
     let ctx = Ctx { ws, we, prod, unknown_cat, camp };
     if let Ok(bf) = std::env::var("SS_BENCHFILE") {
+        let _ = get_links(); // benchmarks run alone
         // single-threaded parse benchmark on one warm file (no output)
         let d = map_file(std::path::Path::new(&bf));
         let d: &'static [u8] = Box::leak(d.to_vec().into_boxed_slice());
@@ -1142,6 +1167,8 @@ fn main() {
         po.keys.release_all();
     }
     let pouts = pouts;
+    let links = get_links();
+    lap("links ready");
 
     // P3: drop losers, map users -> persons per user bucket; collect names of unlinked users
     let next = AtomicUsize::new(0);
