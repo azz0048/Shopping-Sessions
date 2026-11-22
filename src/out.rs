@@ -157,23 +157,23 @@ pub fn process_person(ev: &[Ev], cs: &[Ck], name_ref: u64, w: &mut PersonWork, w
 }
 
 pub fn write_user_daily(path: &Path, rows: &[URow], namebuf: &[u8], cats: &[&'static [u8]]) {
-    let names: Vec<&[u8]> = rows.iter().map(|r| &namebuf[(r.name >> 16) as usize..((r.name >> 16) + (r.name & 0xFFFF)) as usize]).collect();
-    let days: Vec<i32> = rows.iter().map(|r| r.day).collect();
-    let sess: Vec<i32> = rows.iter().map(|r| r.sessions as i32).collect();
-    let evs: Vec<i32> = rows.iter().map(|r| r.events as i32).collect();
-    let small = rows.iter().all(|r| r.rev <= i32::MAX as u64);
-    let rev: Vec<i64> = if small { Vec::new() } else { rows.iter().map(|r| r.rev as i64).collect() };
-    let rev32: Vec<i32> = if small { rows.iter().map(|r| r.rev as i32).collect() } else { Vec::new() };
-    let top: Vec<Option<&[u8]>> = rows.iter().map(|r| if r.top >= 0 { Some(cats[r.top as usize]) } else { None }).collect();
-    let cols = [
-        pq::Column { name: "user_id", data: pq::Data::Str(&names), date: false },
-        pq::Column { name: "day", data: pq::Data::I32(&days), date: true },
-        pq::Column { name: "sessions", data: pq::Data::I32(&sess), date: false },
-        pq::Column { name: "events", data: pq::Data::I32(&evs), date: false },
-        pq::Column { name: "revenue_cents", data: if small { pq::Data::I32(&rev32) } else { pq::Data::I64(&rev) }, date: false },
-        pq::Column { name: "top_category", data: pq::Data::OptStr(&top), date: false },
-    ];
-    pq::write(path, &cols, rows.len()).expect("write user_daily");
+    let nb: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(namebuf) };
+    let mut w = pq::StreamWriter::create(path, rows.len()).expect("create user_daily");
+    w.col_str("user_id", |i| {
+        let r = rows[i].name;
+        &nb[(r >> 16) as usize..((r >> 16) + (r & 0xFFFF)) as usize]
+    })
+    .unwrap();
+    w.col_i32("day", true, |i| rows[i].day).unwrap();
+    w.col_i32("sessions", false, |i| rows[i].sessions as i32).unwrap();
+    w.col_i32("events", false, |i| rows[i].events as i32).unwrap();
+    if rows.iter().all(|r| r.rev <= i32::MAX as u64) {
+        w.col_i32("revenue_cents", false, |i| rows[i].rev as i32).unwrap();
+    } else {
+        w.col_i64("revenue_cents", |i| rows[i].rev as i64).unwrap();
+    }
+    w.col_opt_dict("top_category", cats, |i| if rows[i].top >= 0 { Some(rows[i].top as u32) } else { None }).unwrap();
+    w.finish().expect("write user_daily");
 }
 
 pub struct CRow {
