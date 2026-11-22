@@ -853,6 +853,7 @@ fn main() {
     let ws = manifest_ts(&mtext, "\"window_start\"");
     init_month_table(1970 + ws.div_euclid(DAY) / 365);
     let we = manifest_ts(&mtext, "\"window_end\"");
+    init_window_months(ws - 8 * DAY, we + 6 * DAY);
     assert!(we - ws + WEEK < (1i64 << 32), "window too long");
 
     let ev_files: Vec<&'static [u8]> = list_csv(&data_dir.join("events")).iter().map(|p| map_file(p)).collect();

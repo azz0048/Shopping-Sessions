@@ -9,6 +9,14 @@ fn rng(s: &mut u64) -> u64 { *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17; *s }
 #[test]
 fn fuzz() {
     init_month_table(2026);
+    // window-month table around Oct 2026 (Sep..Nov cached), then around a leap February
+    init_window_months(parse_ts(b"2026-09-20T00:00:00Z").unwrap(), parse_ts(b"2026-11-10T00:00:00Z").unwrap());
+    fuzz_body();
+    init_window_months(parse_ts(b"2028-01-25T00:00:00Z").unwrap(), parse_ts(b"2028-03-03T00:00:00Z").unwrap());
+    fuzz_body();
+}
+
+fn fuzz_body() {
     let mut st = 0x1234_5678_9abc_def1u64;
     let alphabet = b"0123456789-:TZ+tz .\r9";
     let bases: Vec<&[u8]> = vec![

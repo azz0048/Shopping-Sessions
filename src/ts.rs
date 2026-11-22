@@ -226,6 +226,92 @@ pub fn parse_dt_fast(s: &[u8]) -> Option<i64> {
     Some(month_start_ms(y, mo) + (d - 1) * 86_400_000 + h * 3_600_000 + mi * 60_000 + se * 1000)
 }
 
+// ---------- window months: "YYYY-MM-" prefixes of the few months around the window ----------
+// Every in-window F1/F2 timestamp (and nearly every ingest_ts) starts with one of these 8 bytes, so
+// one word compare replaces validating and decoding year and month. Anything else falls back
+// to parse_dt_fast, so results never depend on the table.
+const WM: usize = 4;
+static mut WM_KEY: [u64; WM] = [0; WM];
+static mut WM_START: [i64; WM] = [0; WM]; // ms of the month's first day
+static mut WM_DIM: [i64; WM] = [0; WM]; // days in month; 0 = unused slot (never a hit)
+
+fn civil_from_days(z: i64) -> (i64, i64) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + (m <= 2) as i64, m)
+}
+
+/// Fill the table with the months intersecting [lo_ms, hi_ms] (first WM of them). Call once.
+#[allow(static_mut_refs)]
+pub fn init_window_months(lo_ms: i64, hi_ms: i64) {
+    let (mut y, mut m) = civil_from_days(lo_ms.div_euclid(86_400_000));
+    for i in 0..WM {
+        let start = days_from_civil(y, m, 1) * 86_400_000;
+        if start > hi_ms || !(0..=9999).contains(&y) {
+            break;
+        }
+        let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+        let dim = days_from_civil(ny, nm, 1) - days_from_civil(y, m, 1);
+        let key = format!("{y:04}-{m:02}-");
+        unsafe {
+            WM_KEY[i] = u64::from_le_bytes(key.as_bytes().try_into().unwrap());
+            WM_START[i] = start;
+            WM_DIM[i] = dim;
+        }
+        (y, m) = (ny, nm);
+    }
+}
+
+/// (month start ms, days in month) for a cached "YYYY-MM-" word; dim 0 on a miss. Branch-free.
+#[inline(always)]
+#[allow(static_mut_refs)]
+fn window_month(a: u64) -> (i64, i64) {
+    let (mut st, mut dim) = (0i64, 0i64);
+    unsafe {
+        for i in 0..WM {
+            let hit = a == WM_KEY[i];
+            st = if hit { WM_START[i] } else { st };
+            dim = if hit { WM_DIM[i] } else { dim };
+        }
+    }
+    (st, dim)
+}
+
+/// parse_dt_fast with the year-month decoded by table lookup (s.len() >= 20).
+#[inline(always)]
+pub fn parse_dt_win(s: &[u8]) -> Option<i64> {
+    let a = u64::from_le_bytes(s[0..8].try_into().unwrap());
+    let (st, dim) = window_month(a);
+    if dim == 0 {
+        return parse_dt_fast(s);
+    }
+    let b = u64::from_le_bytes(s[8..16].try_into().unwrap());
+    let c = u32::from_le_bytes(s[16..20].try_into().unwrap()) as u64;
+    if (b & SEP_B_MASK) != SEP_B || (c & 0xFF) != b':' as u64 {
+        return None;
+    }
+    let tb = b ^ 0x3030_3030_3030_3030;
+    let tc = c ^ 0x3030_3030;
+    if bad_digits(tb, DIG_B) || bad_digits(tc, 0x00FF_FF00) {
+        return None;
+    }
+    let pb = pairs(tb & DIG_B);
+    let pc = pairs(tc & 0x00FF_FF00);
+    let d = byte(pb, 0);
+    let h = byte(pb, 3);
+    let mi = byte(pb, 6);
+    let se = byte(pc, 1);
+    if (d - 1) as u64 >= dim as u64 || h > 23 || mi > 59 || se > 59 {
+        return None;
+    }
+    Some(st + (d - 1) * 86_400_000 + h * 3_600_000 + mi * 60_000 + se * 1000)
+}
+
 /// Eight ASCII digits (already minus '0', most significant in the lowest byte) to their value.
 #[inline(always)]
 fn parse8(chunk: u64) -> u64 {
@@ -246,7 +332,7 @@ pub fn parse_ts_fast(s: &[u8]) -> Option<i64> {
     let n = s.len();
     if n == 20 {
         if s[19] == b'Z' {
-            return parse_dt_fast(s);
+            return parse_dt_win(s);
         }
     } else if n == 25 {
         let sign = match s[19] {
@@ -259,7 +345,7 @@ pub fn parse_ts_fast(s: &[u8]) -> Option<i64> {
         if s[22] != b':' || oh > 23 || om > 59 {
             return None;
         }
-        return Some(parse_dt_fast(s)? - sign * (oh * 60 + om) * 60_000);
+        return Some(parse_dt_win(s)? - sign * (oh * 60 + om) * 60_000);
     }
     parse_ts_slow_f3(s)
 }
@@ -323,7 +409,14 @@ pub fn parse_ingest(s: &[u8]) -> Option<i64> {
         let a = u64::from_le_bytes(s[0..8].try_into().unwrap());
         let b = u64::from_le_bytes(s[8..16].try_into().unwrap());
         let c = u32::from_le_bytes(s[16..20].try_into().unwrap()) as u64;
-        if (a & SEP_A_MASK) == SEP_A && (b & SEP_B_MASK) == SEP_B && (c & 0xFF_0000_FF) == ((b'Z' as u64) << 24 | b':' as u64) {
+        let seps_bc = (b & SEP_B_MASK) == SEP_B && (c & 0xFF_0000_FF) == ((b'Z' as u64) << 24 | b':' as u64);
+        let (st, dim) = window_month(a);
+        if dim != 0 && seps_bc {
+            let pb = pairs((b ^ 0x3030_3030_3030_3030) & DIG_B);
+            let pc = pairs((c ^ 0x3030_3030) & 0x00FF_FF00);
+            return Some(st + (byte(pb, 0) - 1) * 86_400_000 + byte(pb, 3) * 3_600_000 + byte(pb, 6) * 60_000 + byte(pc, 1) * 1000);
+        }
+        if (a & SEP_A_MASK) == SEP_A && seps_bc {
             let pa = pairs((a ^ 0x3030_3030_3030_3030) & DIG_A);
             let pb = pairs((b ^ 0x3030_3030_3030_3030) & DIG_B);
             let pc = pairs((c ^ 0x3030_3030) & 0x00FF_FF00);
