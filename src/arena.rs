@@ -26,6 +26,23 @@ pub fn arena() -> &'static Arena {
     unsafe { ARENA.as_ref().unwrap() }
 }
 
+#[cfg(windows)]
+fn map_region(size: usize) -> usize {
+    // Local dev/test builds only; the scored build is Linux.
+    unsafe extern "system" {
+        fn VirtualAlloc(addr: *mut u8, size: usize, ty: u32, protect: u32) -> *mut u8;
+    }
+    let p = unsafe { VirtualAlloc(std::ptr::null_mut(), size, 0x3000, 0x04) };
+    assert!(!p.is_null(), "arena VirtualAlloc failed");
+    if std::env::var_os("SS_PRETOUCH").is_some() {
+        for i in (0..size).step_by(4096) {
+            unsafe { std::ptr::write_volatile(p.add(i), 0) };
+        }
+    }
+    p as usize
+}
+
+#[cfg(unix)]
 fn map_region(size: usize) -> usize {
     unsafe {
         let p = libc::mmap(

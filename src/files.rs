@@ -26,6 +26,15 @@ pub fn map_file(p: &Path) -> &'static [u8] {
     }
     let m = unsafe { memmap2::Mmap::map(&f).expect("mmap") };
     let m: &'static memmap2::Mmap = Box::leak(Box::new(m));
+    #[cfg(windows)]
+    if std::env::var_os("SS_PRETOUCH").is_some() {
+        // dev only: fault the mapping in up front so phase timings show compute, not page faults
+        let mut s = 0u8;
+        for i in (0..m.len()).step_by(4096) {
+            s = s.wrapping_add(unsafe { std::ptr::read_volatile(m.as_ptr().add(i)) });
+        }
+        std::hint::black_box(s);
+    }
     &m[..]
 }
 

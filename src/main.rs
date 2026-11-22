@@ -881,6 +881,15 @@ fn main() {
 
     let block: usize = std::env::var("SS_BLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(8192);
     init_arena(1 << 30, block);
+    #[cfg(windows)]
+    if let Some(gb) = std::env::var("SS_PRETOUCH").ok().and_then(|v| v.parse::<usize>().ok()) {
+        // dev only: map + touch arena regions up front (Windows page faults are far costlier than Linux THP)
+        let n = (gb << 30) / block;
+        let v: Vec<(usize, u32)> = (0..n).map(|_| { let (p, id) = arena().alloc(); (p as usize, id) }).collect();
+        arena().release(&v);
+        arena_flush_tl();
+        lap("pretouch");
+    }
 
     // L: links
     let mut lchunks = Vec::new();
@@ -909,6 +918,30 @@ fn main() {
         let d = map_file(std::path::Path::new(&bf));
         let d: &'static [u8] = Box::leak(d.to_vec().into_boxed_slice());
         let c = Chunk { data: d, start: 0, end: d.len(), kind: 0 };
+        if let Ok(mode) = std::env::var("SS_BENCHMODE") {
+            let mode: u32 = mode.parse().unwrap();
+            let mut best = f64::MAX;
+            for _ in 0..9 {
+                let t = Instant::now();
+                let mut p = chunk_start(d, 0, d.len());
+                let mut f: [&'static [u8]; 7] = [&[]; 7];
+                let (mut n, mut acc) = (0usize, 0u64);
+                while p < d.len() {
+                    let (np, ok) = split_at::<7>(d, p, &mut f);
+                    p = np;
+                    n += 1;
+                    if !ok { continue; }
+                    acc = acc.wrapping_add(f[0].len() as u64);
+                    if mode >= 2 { let (h1, h2) = hash_wide(f[0]); acc ^= h1 ^ h2 as u64 ^ hash1(f[1]); }
+                    if mode >= 3 { acc = acc.wrapping_add(parse_ingest(f[3]).unwrap_or(0) as u64).wrapping_add(parse_ts_fast(f[2]).unwrap_or(0) as u64); }
+                    if mode >= 4 { acc = acc.wrapping_add(parse_price(f[6]).unwrap_or(0) as u64).wrapping_add(f[4].len() as u64); }
+                }
+                std::hint::black_box(acc);
+                best = best.min(t.elapsed().as_nanos() as f64 / n as f64);
+            }
+            eprintln!("mode {mode}: {best:.1} ns/line");
+            std::process::exit(0);
+        }
         let mut best = f64::MAX;
         for it in 0..15 {
             let mut out = ParseOut {
@@ -1296,6 +1329,10 @@ fn main() {
     }
     write_campaign_daily(&out_dir.join("campaign_daily").join("part-000.parquet"), &crow);
     lap("done");
+    if let Some(d) = std::env::var_os("SS_CSV") {
+        let users: Vec<(&[URow], &[u8])> = works.iter().map(|w| (&w.rows[..], &w.namebuf[..])).collect();
+        dump_csv(std::path::Path::new(&d), &users, &cats, &crow);
+    }
     if verbose {
         let urows: usize = works.iter().map(|w| w.rows.len()).sum();
         eprintln!("user rows {urows}, campaign rows {}", crow.len());

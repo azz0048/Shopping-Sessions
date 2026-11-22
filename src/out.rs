@@ -176,6 +176,46 @@ pub fn write_user_daily(path: &Path, rows: &[URow], namebuf: &[u8], cats: &[&'st
     w.finish().expect("write user_daily");
 }
 
+fn ymd(days: i64) -> String {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + (m <= 2) as i64;
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Debug/test only (SS_CSV=<dir>): both tables as CSV, in the dev-answer format.
+pub fn dump_csv(dir: &Path, users: &[(&[URow], &[u8])], cats: &[&'static [u8]], crows: &[CRow]) {
+    use std::io::Write;
+    std::fs::create_dir_all(dir).unwrap();
+    let mut f = std::io::BufWriter::new(std::fs::File::create(dir.join("user_daily.csv")).unwrap());
+    writeln!(f, "user_id,day,sessions,events,revenue_cents,top_category").unwrap();
+    for (rows, nb) in users {
+        for r in rows.iter() {
+            let name = &nb[(r.name >> 16) as usize..((r.name >> 16) + (r.name & 0xFFFF)) as usize];
+            f.write_all(name).unwrap();
+            write!(f, ",{},{},{},{},", ymd(r.day as i64), r.sessions, r.events, r.rev).unwrap();
+            if r.top >= 0 {
+                f.write_all(cats[r.top as usize]).unwrap();
+            }
+            f.write_all(b"\n").unwrap();
+        }
+    }
+    let mut f = std::io::BufWriter::new(std::fs::File::create(dir.join("campaign_daily.csv")).unwrap());
+    writeln!(f, "campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions").unwrap();
+    for r in crows {
+        f.write_all(r.camp).unwrap();
+        f.write_all(b",").unwrap();
+        f.write_all(r.chan).unwrap();
+        writeln!(f, ",{},{},{},{},{}", ymd(r.day as i64), r.v[0], r.v[1], r.v[2], r.v[3]).unwrap();
+    }
+}
+
 pub struct CRow {
     pub camp: &'static [u8],
     pub chan: &'static [u8],

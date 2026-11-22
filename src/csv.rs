@@ -193,6 +193,7 @@ pub fn populate(data: &'static [u8], start: usize, end: usize) {
     }
     let a = (data.as_ptr() as usize + start) & !4095;
     let b = data.as_ptr() as usize + end;
+    #[cfg(unix)]
     if b > a {
         unsafe { libc::madvise(a as *mut libc::c_void, b - a, 22 /* MADV_POPULATE_READ */) };
     }
