@@ -4,7 +4,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY .cargo .cargo
 COPY src src
 # Fast binary: AVX-512 (cascadelake) flags from .cargo/config.toml.
-ENV XL_CKPF=0
+ENV XL_IOADV_DEF=0
 RUN cargo build --release --target x86_64-unknown-linux-gnu --bin pipeline \
  && cp target/x86_64-unknown-linux-gnu/release/pipeline /pipeline
 # Safety net: generic pipeline for baseline x86-64, used only if the CPU
