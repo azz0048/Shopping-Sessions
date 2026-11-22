@@ -172,6 +172,100 @@ pub fn split_at<const N: usize>(data: &'static [u8], p: usize, out: &mut [&'stat
     (q + 1, ok)
 }
 
+/// newline / comma / quote masks of 64 bytes.
+#[inline(always)]
+unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
+    let v0 = _mm256_loadu_si256(p as *const __m256i);
+    let v1 = _mm256_loadu_si256(p.add(32) as *const __m256i);
+    let m = |c: u8| {
+        let s = _mm256_set1_epi8(c as i8);
+        (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, s)) as u32 as u64)
+            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, s)) as u32 as u64) << 32)
+    };
+    (m(b'\n'), m(b','), m(b'"'))
+}
+
+/// Inclusive prefix xor of a 64-bit mask (bit i = parity of bits 0..=i).
+#[inline(always)]
+fn pxor64(mut x: u64) -> u64 {
+    x ^= x << 1;
+    x ^= x << 2;
+    x ^= x << 4;
+    x ^= x << 8;
+    x ^= x << 16;
+    x ^= x << 32;
+    x
+}
+
+/// Same contract as `split_at`, with validity decided on bitmasks:
+/// with C = commas, Q = quotes, S = field first bytes, E = field last bytes (all within the line),
+/// the line is valid iff |C| = N-1, Q is a subset of S|E, |Q| is even, and no comma lies between
+/// a quote and its partner (prefix-xor of Q has no comma under it). Quote pairs then sit exactly
+/// at the first and last byte of one field (a 1-byte field cannot hold a pair).
+#[cfg_attr(not(feature = "prof"), inline(always))]
+#[cfg_attr(feature = "prof", inline(never))]
+pub fn split_at2<const N: usize>(data: &'static [u8], p: usize, out: &mut [&'static [u8]; N]) -> (usize, bool) {
+    if p + 128 <= data.len() {
+        if PREFETCH > 0 {
+            unsafe { _mm_prefetch(data.as_ptr().wrapping_add(p + PREFETCH) as *const i8, _MM_HINT_T0) };
+        }
+        let base = unsafe { data.as_ptr().add(p) };
+        let (n0, c0, q0) = unsafe { masks64(base) };
+        let found;
+        let (len, c, q): (usize, u128, u128);
+        if n0 != 0 {
+            let l = n0.trailing_zeros() as usize;
+            let m = (1u64 << l) - 1;
+            len = l;
+            c = (c0 & m) as u128;
+            q = (q0 & m) as u128;
+            found = true;
+        } else {
+            let (n1, c1, q1) = unsafe { masks64(base.add(64)) };
+            let l = n1.trailing_zeros() as usize; // 64 if none
+            let m = if l == 64 { 0 } else { (1u64 << l) - 1 };
+            len = 64 + l;
+            c = c0 as u128 | (((c1 & m) as u128) << 64);
+            q = q0 as u128 | (((q1 & m) as u128) << 64);
+            found = n1 != 0;
+        }
+        if found {
+            let next = p + len + 1;
+            if c.count_ones() as usize != N - 1 {
+                return (next, false);
+            }
+            // len >= N-1 >= 1 here
+            let s = (c << 1) | 1;
+            let e = (c >> 1) | (1u128 << (len - 1));
+            let lo = pxor64(q as u64);
+            let hi = pxor64((q >> 64) as u64) ^ 0u64.wrapping_sub(lo >> 63);
+            let inside = lo as u128 | ((hi as u128) << 64);
+            let valid = (q & !(s | e)) == 0 && q.count_ones() & 1 == 0 && (inside & c) == 0;
+            let mut cc = c;
+            let mut a = 0usize;
+            for k in 0..N {
+                let b = if k + 1 < N {
+                    let t = cc.trailing_zeros() as usize;
+                    cc &= cc.wrapping_sub(1);
+                    t
+                } else {
+                    len
+                };
+                let qd = (unsafe { *base.add(a) } == b'"') as usize;
+                out[k] = unsafe { std::slice::from_raw_parts(base.add(a + qd), (b - a).saturating_sub(2 * qd)) };
+                a = b + 1;
+            }
+            return (next, valid);
+        }
+    }
+    let q = match memchr::memchr(b'\n', &data[p..]) {
+        Some(q) => p + q,
+        None => data.len(),
+    };
+    let ok = split::<N>(&data[p..q], out);
+    (q + 1, ok)
+}
+
 /// First line start to parse in a chunk (skips the file header for the chunk at offset 0).
 #[inline(always)]
 pub fn chunk_start(data: &'static [u8], start: usize, end: usize) -> usize {

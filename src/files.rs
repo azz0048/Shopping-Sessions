@@ -67,7 +67,7 @@ pub fn read_small_table(path: &Path) -> Vec<[&'static [u8]; 2]> {
     let mut p = chunk_start(d, 0, d.len());
     let mut f: [&'static [u8]; 2] = [&[]; 2];
     while p < d.len() {
-        let (np, ok) = split_at::<2>(d, p, &mut f);
+        let (np, ok) = split_at2::<2>(d, p, &mut f);
         p = np;
         if ok {
             v.push(f);

@@ -227,21 +227,20 @@ pub struct Rec {
     ts: u32, // ms since window start
     pc: u32, // purchase price (low 24 bits, 0 if not a purchase) | category << 24
 }
-/// A surviving event, scattered by person key.
-#[derive(Clone, Copy)]
+/// A surviving event, scattered by person bucket (pid & (UB - 1)). In P4, pid is replaced by
+/// the person's slot in the bucket (pid >> UB_BITS).
+///
+/// Person ids are dense u32: a linked person is the global side index of its byte-smallest ID
+/// (< s_round); an unlinked user is s_round + (local << UB_BITS | user bucket), local being its
+/// first-seen index among the unlinked users of that user bucket.
+#[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub struct Ev {
-    pub person: u64,
-    pub ts: u32,
-    pub pc: u32,
-}
-/// Compact record for the per-bucket radix sort in P4.
-#[derive(Clone, Copy, Default)]
-pub struct EvP {
     pub ts: u32,
     pub pc: u32,
     pub pid: u32,
 }
+pub type EvP = Ev;
 
 /// Stable LSD radix sort by ts (31 bits: 11 + 11 + 9), ping-ponging between a and b.
 fn radix_ts(a: &mut Vec<EvP>, b: &mut Vec<EvP>) {
@@ -285,14 +284,25 @@ fn radix_ts(a: &mut Vec<EvP>, b: &mut Vec<EvP>) {
     std::mem::swap(a, b);
 }
 
-/// A valid click. ts is ms since window start - 7 days.
+/// A valid click keyed by user hash (P1 output, scattered by user bucket).
+/// ts is ms since window start - 7 days.
 #[derive(Clone, Copy)]
 #[repr(C)]
-pub struct Ck {
-    pub person: u64,
+pub struct CkU {
+    pub user: u64,
     pub cid: u64,
     pub ts: u32,
     pub camp: u32,
+}
+/// A valid click of a person (P3 output, scattered by person bucket).
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct Ck {
+    pub cid: u64,
+    pub pid: u32,
+    pub ts: u32,
+    pub camp: u32,
+    pub _pad: u32,
 }
 
 #[inline(always)]
@@ -322,7 +332,7 @@ struct Ctx {
 struct ParseOut {
     keys: WcSet<Key, 4>,
     recs: WcSet<Rec, 8>,
-    ck: WcSet<Ck, 8>,
+    ck: WcSet<CkU, 8>,
 }
 
 fn parse_events_chunk(c: &Chunk, ctx: &Ctx, out: &mut ParseOut) {
@@ -332,7 +342,7 @@ fn parse_events_chunk(c: &Chunk, ctx: &Ctx, out: &mut ParseOut) {
     let mut p = chunk_start(d, c.start, c.end);
     let mut f: [&'static [u8]; 7] = [&[]; 7];
     while p < c.end {
-        let (np, ok) = split_at::<7>(d, p, &mut f);
+        let (np, ok) = split_at2::<7>(d, p, &mut f);
         p = np;
         if !ok {
             continue;
@@ -397,7 +407,7 @@ fn parse_clicks_chunk(c: &Chunk, ctx: &Ctx, out: &mut ParseOut) {
     let mut p = chunk_start(d, c.start, c.end);
     let mut f: [&'static [u8]; 4] = [&[]; 4];
     while p < c.end {
-        let (np, ok) = split_at::<4>(d, p, &mut f);
+        let (np, ok) = split_at2::<4>(d, p, &mut f);
         p = np;
         if !ok || f[0].is_empty() || f[1].is_empty() {
             continue;
@@ -414,7 +424,7 @@ fn parse_clicks_chunk(c: &Chunk, ctx: &Ctx, out: &mut ParseOut) {
             None => continue,
         };
         let u = hash1(f[1]);
-        out.ck.push(ub_of(u), Ck { person: u, cid: pack(f[0]), ts: (ts - lo) as u32, camp });
+        out.ck.push(ub_of(u), CkU { user: u, cid: pack(f[0]), ts: (ts - lo) as u32, camp });
     }
 }
 
@@ -439,7 +449,7 @@ fn parse_links_chunk(c: &Chunk, out: &mut LinkParse) {
     let mut p = chunk_start(d, c.start, c.end);
     let mut f: [&'static [u8]; 2] = [&[]; 2];
     while p < c.end {
-        let (np, ok) = split_at::<2>(d, p, &mut f);
+        let (np, ok) = split_at2::<2>(d, p, &mut f);
         p = np;
         if !ok || f[0].is_empty() || f[1].is_empty() {
             continue;
@@ -457,46 +467,29 @@ pub struct Links {
     // per user bucket: open-addressing table slice [tab_off, tab_off + mask + 1)
     tab_off: Vec<usize>,
     tab_mask: Vec<usize>,
-    side_off: Vec<usize>,
     tkeys: &'static [u64],
+    /// person id (global side index of the component's byte-smallest ID) per table slot
     tvals: &'static [u32],
-    pkey: &'static [u64],
-    pref: &'static [u64],
+    /// side index -> ID ref (the name, for person ids)
+    dref: &'static [u64],
+    /// s_total rounded up to a multiple of UB: the first unlinked person id
+    s_round: u32,
 }
 impl Links {
-    /// Person key and name ref for a linked ID (in user bucket b), or None if the ID is in no link.
-#[cfg_attr(not(feature = "prof"), inline(always))]
-#[cfg_attr(feature = "prof", inline(never))]
-    fn lookup(&self, b: usize, h: u64) -> Option<(u64, u64)> {
+    /// Person id of a linked ID (in user bucket b), or None if the ID is in no link.
+    #[cfg_attr(not(feature = "prof"), inline(always))]
+    #[cfg_attr(feature = "prof", inline(never))]
+    fn lookup(&self, b: usize, h: u64) -> Option<u32> {
         let off = self.tab_off[b];
         let mask = self.tab_mask[b];
         let mut s = (h as usize) & mask;
         loop {
             let k = unsafe { *self.tkeys.get_unchecked(off + s) };
             if k == h {
-                let i = self.side_off[b] + unsafe { *self.tvals.get_unchecked(off + s) } as usize;
-                return unsafe { Some((*self.pkey.get_unchecked(i), *self.pref.get_unchecked(i))) };
+                return Some(unsafe { *self.tvals.get_unchecked(off + s) });
             }
             if k == 0 {
                 return None;
-            }
-            s = (s + 1) & mask;
-        }
-    }
-    #[allow(dead_code)]
-    #[inline(always)]
-    fn map(&self, b: usize, h: u64, r: u64) -> (u64, u64) {
-        let off = self.tab_off[b];
-        let mask = self.tab_mask[b];
-        let mut s = (h as usize) & mask;
-        loop {
-            let k = unsafe { *self.tkeys.get_unchecked(off + s) };
-            if k == h {
-                let i = self.side_off[b] + unsafe { *self.tvals.get_unchecked(off + s) } as usize;
-                return unsafe { (*self.pkey.get_unchecked(i), *self.pref.get_unchecked(i)) };
-            }
-            if k == 0 {
-                return (h, r);
             }
             s = (s + 1) & mask;
         }
@@ -618,7 +611,6 @@ fn build_links(lp: Vec<LinkParse>, nthreads: usize) -> Links {
     }
     let tkeys: &'static mut [u64] = huge_zeroed(t_total);
     let tvals: &'static mut [u32] = huge_zeroed(t_total);
-    let dkey: &'static mut [u64] = huge_zeroed(s_total);
     let dref: &'static mut [u64] = huge_zeroed(s_total);
     let dpre: &'static mut [u64] = huge_zeroed(s_total);
     let pair_ids: &'static mut [u32] = huge_zeroed(2 * npairs);
@@ -627,7 +619,6 @@ fn build_links(lp: Vec<LinkParse>, nthreads: usize) -> Links {
     {
         let tk = SendPtr(tkeys.as_mut_ptr());
         let tv = SendPtr(tvals.as_mut_ptr());
-        let dk = SendPtr(dkey.as_mut_ptr());
         let dp = SendPtr(dpre.as_mut_ptr());
         let dr = SendPtr(dref.as_mut_ptr());
         let pi = SendPtr(pair_ids.as_mut_ptr());
@@ -635,7 +626,7 @@ fn build_links(lp: Vec<LinkParse>, nthreads: usize) -> Links {
         let next = AtomicUsize::new(0);
         let (lp, off, tab_off, tab_mask, side_off) = (&lp, &off, &tab_off, &tab_mask, &side_off);
         run_threads(nthreads, |_| {
-            let (tk, tv, dk, dr, dp, pi, us) = (&tk, &tv, &dk, &dr, &dp, &pi, &us);
+            let (tk, tv, dr, dp, pi, us) = (&tk, &tv, &dr, &dp, &pi, &us);
             loop {
                 let b = next.fetch_add(1, Relaxed);
                 if b >= UB {
@@ -652,7 +643,6 @@ fn build_links(lp: Vec<LinkParse>, nthreads: usize) -> Links {
                                 unsafe {
                                     *tk.0.add(to + s) = h;
                                     *tv.0.add(to + s) = nd;
-                                    *dk.0.add(so + nd as usize) = h;
                                     *dr.0.add(so + nd as usize) = r;
                                     *dp.0.add(so + nd as usize) = pre;
                                     *us.0.add(so + nd as usize) = 1;
@@ -750,38 +740,40 @@ fn build_links(lp: Vec<LinkParse>, nthreads: usize) -> Links {
         });
     }
     lap("min names");
-    let pkey: &'static mut [u64] = huge_zeroed(s_total);
-    let pref: &'static mut [u64] = huge_zeroed(s_total);
+    // table values: local side index -> person id (global side index of the smallest ID)
     {
-        let (pk, pr) = (SendPtr(pkey.as_mut_ptr()), SendPtr(pref.as_mut_ptr()));
-        let (root, dkey, dref, used): (&[u32], &[u64], &[u64], &[u8]) = (root, dkey, dref, used);
+        let tv = SendPtr(tvals.as_mut_ptr());
+        let (root, tkeys, tab_off, tab_mask, side_off): (&[u32], &[u64], &[usize], &[usize], &[usize]) =
+            (root, tkeys, &tab_off, &tab_mask, &side_off);
         let next = AtomicUsize::new(0);
         run_threads(nthreads, |_| {
-            let (pk, pr) = (&pk, &pr);
+            let tv = &tv;
             loop {
-                let c = next.fetch_add(1, Relaxed);
-                let lo = c * chunk;
-                if lo >= s_total {
+                let b = next.fetch_add(32, Relaxed);
+                if b >= UB {
                     break;
                 }
-                for i in lo..(lo + chunk).min(s_total) {
-                    if used[i] == 0 {
-                        continue;
-                    }
-                    let m = minid[root[i] as usize].load(Relaxed) as usize;
-                    unsafe {
-                        *pk.0.add(i) = dkey[m];
-                        *pr.0.add(i) = dref[m];
+                for b in b..(b + 32).min(UB) {
+                    let (to, so) = (tab_off[b], side_off[b]);
+                    for s in 0..=tab_mask[b] {
+                        if tkeys[to + s] != 0 {
+                            unsafe {
+                                let v = tv.0.add(to + s);
+                                *v = minid[root[so + *v as usize] as usize].load(Relaxed);
+                            }
+                        }
                     }
                 }
             }
         });
     }
-    lap("person arrays");
+    lap("person ids");
     if verbose {
         eprintln!("      links: {npairs} pairs, {s_total} sides");
     }
-    Links { tab_off, tab_mask, side_off, tkeys, tvals, pkey, pref }
+    let s_round = s_total.div_ceil(UB) * UB;
+    assert!(s_round < (1 << 31), "too many linked IDs");
+    Links { tab_off, tab_mask, tkeys, tvals, dref, s_round: s_round as u32 }
 }
 
 fn main() {
@@ -927,11 +919,12 @@ fn main() {
                 let mut f: [&'static [u8]; 7] = [&[]; 7];
                 let (mut n, mut acc) = (0usize, 0u64);
                 while p < d.len() {
-                    let (np, ok) = split_at::<7>(d, p, &mut f);
+                    let (np, ok) = if mode >= 10 { split_at2::<7>(d, p, &mut f) } else { split_at::<7>(d, p, &mut f) };
                     p = np;
                     n += 1;
                     if !ok { continue; }
-                    acc = acc.wrapping_add(f[0].len() as u64);
+                    acc = acc.wrapping_add(f[0].len() as u64 + f[3].len() as u64 + f[6].as_ptr() as u64);
+                    let mode = mode % 10;
                     if mode >= 2 { let (h1, h2) = hash_wide(f[0]); acc ^= h1 ^ h2 as u64 ^ hash1(f[1]); }
                     if mode >= 3 { acc = acc.wrapping_add(parse_ingest(f[3]).unwrap_or(0) as u64).wrapping_add(parse_ts_fast(f[2]).unwrap_or(0) as u64); }
                     if mode >= 4 { acc = acc.wrapping_add(parse_price(f[6]).unwrap_or(0) as u64).wrapping_add(f[4].len() as u64); }
@@ -1065,10 +1058,11 @@ fn main() {
 
     // P3: drop losers, map users -> persons per user bucket; collect names of unlinked users
     let next = AtomicUsize::new(0);
-    type P3Out = (WcSet<Ev, 4>, WcSet<Ck, 8>, Vec<(usize, Vec<(u64, u64)>)>);
+    type P3Out = (WcSet<Ev, 16>, WcSet<Ck, 8>, Vec<(usize, Vec<u64>)>);
+    let s_round = links.s_round;
     let order = lpt_order(|b| pouts.iter().map(|po| po.recs.len(b) + po.ck.len(b)).sum(), UB);
     let mouts: Vec<P3Out> = run_threads(nthreads, |_| {
-        let mut eo: WcSet<Ev, 4> = WcSet::new(UB);
+        let mut eo: WcSet<Ev, 16> = WcSet::new(UB);
         let mut co: WcSet<Ck, 8> = WcSet::new(UB);
         let mut names = Vec::new();
         let mut seen = SmallMap::new(0);
@@ -1078,37 +1072,44 @@ fn main() {
                 break;
             }
             let b = order[i];
-            let mut nm: Vec<(u64, u64)> = Vec::new();
+            let mut nm: Vec<u64> = Vec::new();
             let nb: usize = pouts.iter().map(|po| po.recs.len(b)).sum();
             seen.reset(nb / 8 + 64);
+            // all events of the bucket first, so every unlinked user with events has its id
             for po in pouts.iter() {
                 po.recs.for_slices(b, |x| {
                     for r in x {
                         if r.ts == u32::MAX {
                             continue;
                         }
-                        let p = match links.lookup(b, r.user) {
-                            Some((p, _)) => p,
+                        let pid = match links.lookup(b, r.user) {
+                            Some(p) => p,
                             None => {
                                 let n = nm.len() as u32;
-                                if seen.insert_grow(r.user, n, n as usize) == n {
-                                    nm.push((r.user, r.uref));
+                                let l = seen.insert_grow(r.user, n, n as usize);
+                                if l == n {
+                                    nm.push(r.uref);
                                 }
-                                r.user
+                                s_round + ((l << UB_BITS) | b as u32)
                             }
                         };
-                        eo.push(ub_of(p), Ev { person: p, ts: r.ts, pc: r.pc });
+                        eo.push(pid as usize & (UB - 1), Ev { ts: r.ts, pc: r.pc, pid });
                     }
                 });
+            }
+            assert!(((nm.len() as u64) << UB_BITS) + (s_round as u64) < (1u64 << 32), "too many unlinked users");
+            // clicks of unlinked users without events can never credit a session: dropped
+            for po in pouts.iter() {
                 po.ck.for_slices(b, |x| {
                     for c in x {
-                        let p = match links.lookup(b, c.person) {
-                            Some((p, _)) => p,
-                            None => c.person,
+                        let pid = match links.lookup(b, c.user) {
+                            Some(p) => p,
+                            None => match seen.get(c.user) {
+                                Some(l) => s_round + ((l << UB_BITS) | b as u32),
+                                None => continue,
+                            },
                         };
-                        let mut c2 = *c;
-                        c2.person = p;
-                        co.push(ub_of(p), c2);
+                        co.push(pid as usize & (UB - 1), Ck { cid: c.cid, pid, ts: c.ts, camp: c.camp, _pad: 0 });
                     }
                 });
             }
@@ -1118,7 +1119,7 @@ fn main() {
         co.finish();
         (eo, co, names)
     });
-    let mut names_of: Vec<Vec<(u64, u64)>> = (0..UB).map(|_| Vec::new()).collect();
+    let mut names_of: Vec<Vec<u64>> = (0..UB).map(|_| Vec::new()).collect();
     let mut mouts = mouts;
     for m in mouts.iter_mut() {
         for (b, v) in m.2.drain(..) {
@@ -1134,6 +1135,7 @@ fn main() {
     }
 
     // P4: person buckets
+    let base_slots = (s_round >> UB_BITS) as usize;
     let day0 = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1).max(1) as usize;
     let ncats = cats.len();
@@ -1158,7 +1160,7 @@ fn main() {
         };
         let mut sorted: Vec<Ev> = Vec::new();
         let mut pname: Vec<u64> = Vec::new();
-        let mut pperson: Vec<u64> = Vec::new();
+        let mut plist: Vec<u32> = Vec::new();
         let mut ra: Vec<EvP> = Vec::new();
         let mut rb: Vec<EvP> = Vec::new();
         let mut csorted: Vec<Ck> = Vec::new();
@@ -1168,8 +1170,6 @@ fn main() {
         csorted.reserve(maxc);
         w.rows.reserve(maxn * UB / nthreads / 6);
         w.namebuf.reserve(maxn * UB / nthreads / 2);
-        let mut pmap = SmallMap::new(0);
-        let mut nmap = SmallMap::new(0);
         let (mut tgroup, mut tproc) = (0f64, 0f64);
         let (mut pcount, mut pstart, mut pfill, mut cpid, mut ccount, mut cstart): (
             Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>,
@@ -1186,28 +1186,21 @@ fn main() {
             if n == 0 {
                 continue;
             }
-            // group by person: hash -> local id, counting sort, then sort each person's events by ts
-            pmap.reset(n / 6);
+            // group by person slot (pid >> UB_BITS, dense per bucket): counting sort after an
+            // LSD radix sort of the bucket by ts (3 x 11 bits), so the stable scatter by slot
+            // leaves every person's events in ts order.
+            let np = base_slots + names_of[b].len();
             pcount.clear();
-            pperson.clear();
+            pcount.resize(np, 0);
             ra.clear();
             for d in mouts.iter() {
-                d.0.for_slices(b, |x| {
-                    for e in x {
-                        let np = pcount.len() as u32;
-                        let id = pmap.insert_grow(e.person, np, np as usize);
-                        if id == np {
-                            pcount.push(0);
-                            pperson.push(e.person);
-                        }
-                        pcount[id as usize] += 1;
-                        ra.push(EvP { ts: e.ts, pc: e.pc, pid: id });
-                    }
-                });
+                d.0.for_slices(b, |x| ra.extend_from_slice(x));
             }
-            let np = pcount.len();
-            // LSD radix sort of the bucket by ts (3 x 11 bits); the stable scatter by person below
-            // then leaves every person's events in ts order, so no per-person sort is needed.
+            for e in ra.iter_mut() {
+                let s = e.pid >> UB_BITS;
+                e.pid = s;
+                unsafe { *pcount.get_unchecked_mut(s as usize) += 1 };
+            }
             radix_ts(&mut ra, &mut rb);
             pstart.clear();
             let mut acc = 0u32;
@@ -1223,21 +1216,27 @@ fn main() {
             pfill.extend_from_slice(&pstart[..np]);
             for r in ra.iter() {
                 let id = r.pid as usize;
-                unsafe { *sorted.get_unchecked_mut(*pfill.get_unchecked(id) as usize) = Ev { person: *pperson.get_unchecked(id), ts: r.ts, pc: r.pc } };
-                pfill[id] += 1;
+                unsafe {
+                    let f = pfill.get_unchecked_mut(id);
+                    *sorted.get_unchecked_mut(*f as usize) = *r;
+                    *f += 1;
+                }
             }
-            // clicks grouped by the same ids; clicks of persons with no events are irrelevant
+            // clicks grouped by the same slots; clicks of persons with no events are irrelevant
             cpid.clear();
             ccount.clear();
             ccount.resize(np, 0);
             for d in mouts.iter() {
                 d.1.for_slices(b, |x| {
                     for c in x {
-                        let id = pmap.get(c.person).unwrap_or(u32::MAX);
+                        let s = (c.pid >> UB_BITS) as usize;
+                        let id = if pcount[s] != 0 {
+                            ccount[s] += 1;
+                            s as u32
+                        } else {
+                            u32::MAX
+                        };
                         cpid.push(id);
-                        if id != u32::MAX {
-                            ccount[id as usize] += 1;
-                        }
                     }
                 });
             }
@@ -1266,34 +1265,35 @@ fn main() {
                     }
                 });
             }
-            // names of unlinked people in this bucket
-            nmap.reset(names_of[b].len());
-            for (i, &(u, _)) in names_of[b].iter().enumerate() {
-                nmap.insert(u, i as u32);
-            }
             let tg = Instant::now();
             tgroup += (tg - tb).as_secs_f64();
             // resolve all names first and prefetch them, so the copies in process_person hit cache
             pname.clear();
-            for id in 0..np {
-                let person = sorted[pstart[id] as usize].person;
-                let r = match links.lookup(b, person) {
-                    Some((_, r)) => r,
-                    None => names_of[b][nmap.get(person).expect("name") as usize].1,
+            plist.clear();
+            for s in 0..np {
+                if pcount[s] == 0 {
+                    continue;
+                }
+                let r = if s < base_slots {
+                    links.dref[(s << UB_BITS) | b]
+                } else {
+                    names_of[b][s - base_slots]
                 };
                 unsafe {
                     std::arch::x86_64::_mm_prefetch((r & ((1u64 << 47) - 1)) as *const i8, std::arch::x86_64::_MM_HINT_T0)
                 };
                 pname.push(r);
+                plist.push(s as u32);
             }
-            for id in 0..np {
-                let ev = &mut sorted[pstart[id] as usize..pstart[id + 1] as usize];
+            for (k, &s) in plist.iter().enumerate() {
+                let s = s as usize;
+                let ev = &mut sorted[pstart[s] as usize..pstart[s + 1] as usize];
                 debug_assert!(ev.windows(2).all(|w| w[0].ts <= w[1].ts));
-                let cs = &mut csorted[cstart[id] as usize..cstart[id + 1] as usize];
+                let cs = &mut csorted[cstart[s] as usize..cstart[s + 1] as usize];
                 if cs.len() > 1 {
                     cs.sort_unstable_by_key(|c| c.ts);
                 }
-                process_person(ev, cs, pname[id], &mut w, ws, day0, ndays, organic);
+                process_person(ev, cs, pname[k], &mut w, ws, day0, ndays, organic);
             }
             tproc += tg.elapsed().as_secs_f64();
         }
