@@ -28,7 +28,7 @@ pub fn diag_main() -> ! {
             (tag.trim().to_string(), envs)
         })
         .collect();
-    let rounds: usize = 16;
+    let rounds: usize = 12;
     let mut times: Vec<Vec<f64>> = vec![Vec::new(); runs.len()];
     let mut bad: Vec<usize> = vec![0; runs.len()];
     let mut rows: Vec<String> = vec![String::new(); runs.len()];
@@ -45,10 +45,13 @@ pub fn diag_main() -> ! {
             let (_, envs) = &runs[i];
             let _ = std::fs::remove_dir_all(&out);
             let _ = std::fs::create_dir_all(&out);
-            let mut c = Command::new("/pipeline");
+            let bin = envs.iter().find(|(k, _)| k == "BIN").map(|(_, v)| v.clone()).unwrap_or("/pipeline".into());
+            let mut c = Command::new(&bin);
             c.env("DATA_DIR", &p20).env("OUTPUT_DIR", &out).stdout(Stdio::null()).stderr(Stdio::null());
             for (k, v) in envs {
-                c.env(k, v);
+                if k != "BIN" {
+                    c.env(k, v);
+                }
             }
             let t = Instant::now();
             let st = c.status();
@@ -71,7 +74,7 @@ pub fn diag_main() -> ! {
             }
         }
     }
-    eprintln!("==== DIAG5 (gen {gen_s:.1}s) ms over {rounds} ====");
+    eprintln!("==== DIAG6 (gen {gen_s:.1}s) ms over {rounds} ====");
     for (i, (tag, _)) in runs.iter().enumerate() {
         let mut v = times[i].clone();
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());

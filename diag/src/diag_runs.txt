@@ -1,1 +1,1 @@
-base:; combo:XL_QORD=1,XL_PIN=0,XL_FIRST4K=1,XL_S3=0; qord1:XL_QORD=1; pin0:XL_PIN=0; first4k:XL_FIRST4K=1; s3off:XL_S3=0; base2:; combo2:XL_QORD=1,XL_PIN=0,XL_FIRST4K=1,XL_S3=0
+base:BIN=/v/base; pgo:BIN=/v/pgo; bb14:BIN=/v/bb14; ub13:BIN=/v/ub13; ckpf0:BIN=/v/ckpf0; ioadv0:BIN=/v/ioadv0; base2:BIN=/v/base; pgo2:BIN=/v/pgo
