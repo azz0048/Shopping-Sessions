@@ -5,7 +5,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY .cargo .cargo
 COPY vendor vendor
 COPY src src
-RUN cargo build --release --offline --locked --target x86_64-unknown-linux-gnu \
+RUN cargo build --release --offline --locked --features diag --target x86_64-unknown-linux-gnu \
  && cp target/x86_64-unknown-linux-gnu/release/ss /ss
 
 FROM scratch
