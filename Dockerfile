@@ -4,6 +4,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY .cargo .cargo
 COPY src src
 # Fast binary: AVX-512 (cascadelake) flags from .cargo/config.toml.
+ENV XL_CKPF=0
 RUN cargo build --release --target x86_64-unknown-linux-gnu --bin pipeline \
  && cp target/x86_64-unknown-linux-gnu/release/pipeline /pipeline
 # Safety net: generic pipeline for baseline x86-64, used only if the CPU
@@ -13,9 +14,6 @@ RUN RUSTFLAGS="-C target-cpu=x86-64-v2 -C target-feature=+crt-static" \
  && cp /tmp/tport/x86_64-unknown-linux-gnu/release/pipeline-portable /pipeline-portable
 
 FROM scratch
-# Scheduling and memory settings picked by timing variants on the scoring machine
-# (diag4/diag5 branches): queue order 1, no thread pinning, 4K first block, stage-3 split off.
-ENV XL_QORD=1 XL_PIN=0 XL_FIRST4K=1 XL_S3=0
 COPY --from=build /pipeline /pipeline
 COPY --from=build /pipeline-portable /pipeline-portable
 USER 1000:1000
