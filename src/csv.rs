@@ -110,7 +110,8 @@ unsafe fn masks64x2(p: *const u8) -> ([u64; 2], [u64; 2], [u64; 2]) {
 /// or quoted around the whole field. With commas splitting fields, that holds exactly when each
 /// field's first byte is '"' iff its last byte is (and a quoted field has length >= 2), and
 /// the line's total quote count is 2 x the number of quoted fields (no interior quotes).
-#[inline(always)]
+#[cfg_attr(not(feature = "prof"), inline(always))]
+#[cfg_attr(feature = "prof", inline(never))]
 pub fn split_at<const N: usize>(data: &'static [u8], p: usize, out: &mut [&'static [u8]; N]) -> (usize, bool) {
     if p + 128 <= data.len() {
         if PREFETCH > 0 {

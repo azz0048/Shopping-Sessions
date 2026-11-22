@@ -43,3 +43,23 @@ fn fuzz() {
     }
     eprintln!("{n} ok");
 }
+
+#[test]
+fn fuzz_f3() {
+    init_month_table(2026);
+    let mut st = 0xdead_beef_1234_5678u64;
+    for _ in 0..2_000_000 {
+        let n = (rng(&mut st) % 25) as usize + 1;
+        let mut v: Vec<u8> = (0..n).map(|_| b'0' + (rng(&mut st) % 10) as u8).collect();
+        match rng(&mut st) % 6 {
+            0 => { let i = (rng(&mut st) % n as u64) as usize; v[i] = [b'.', b'-', b'e', b' ', b'Z', 0xd9][(rng(&mut st) % 6) as usize]; }
+            1 => { for x in v.iter_mut().take((rng(&mut st) % n as u64) as usize) { *x = b'0'; } }
+            2 => { v = b"9223372036854775807".to_vec(); if rng(&mut st) % 2 == 0 { v = b"9223372036854775808".to_vec(); } }
+            _ => {}
+        }
+        assert_eq!(parse_ts(&v), parse_ts_fast(&v), "{:?}", String::from_utf8_lossy(&v));
+    }
+    for s in ["0", "00000000000000000", "1", "9999999999999999", "99999999999999999", "0000000000000000001791071890000", "\u{0662}\u{0665}"] {
+        assert_eq!(parse_ts(s.as_bytes()), parse_ts_fast(s.as_bytes()), "{s}");
+    }
+}

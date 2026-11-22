@@ -336,7 +336,8 @@ impl<T: Copy, const K: usize> WcSet<T, K> {
             cold: (0..n).map(|_| Cold { start: std::ptr::null_mut(), id: 0, blocks: Vec::new() }).collect(),
         }
     }
-    #[inline(always)]
+    #[cfg_attr(not(feature = "prof"), inline(always))]
+    #[cfg_attr(feature = "prof", inline(never))]
     pub fn push(&mut self, b: usize, v: T) {
         unsafe {
             let c = *self.cnt.get_unchecked(b) as usize;
@@ -350,7 +351,8 @@ impl<T: Copy, const K: usize> WcSet<T, K> {
         }
     }
     /// Push and return the element's arena handle (block id * cap + index).
-    #[inline(always)]
+    #[cfg_attr(not(feature = "prof"), inline(always))]
+    #[cfg_attr(feature = "prof", inline(never))]
     pub fn push_h(&mut self, b: usize, v: T) -> u32 {
         unsafe {
             let c = *self.cnt.get_unchecked(b) as usize;

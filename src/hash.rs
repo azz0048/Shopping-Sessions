@@ -53,7 +53,8 @@ pub fn hash_seed(s: &[u8], seed: u64) -> u64 {
     let r = (a as u128).wrapping_mul(b as u128);
     mix((r as u64) ^ K0 ^ (n as u64), ((r >> 64) as u64) ^ K1)
 }
-#[inline(always)]
+#[cfg_attr(not(feature = "prof"), inline(always))]
+#[cfg_attr(feature = "prof", inline(never))]
 pub fn hash1(s: &[u8]) -> u64 {
     let h = hash_seed(s, K2);
     if h == 0 { 1 } else { h }
@@ -65,7 +66,8 @@ pub fn hash2(s: &[u8]) -> u32 {
 
 
 /// One-pass ~96-bit fingerprint: (64-bit hash, extra 32 bits).
-#[inline(always)]
+#[cfg_attr(not(feature = "prof"), inline(always))]
+#[cfg_attr(feature = "prof", inline(never))]
 pub fn hash_wide(s: &[u8]) -> (u64, u32) {
     let n = s.len();
     let mut seed = K2 ^ mix(K2 ^ K0, K1);

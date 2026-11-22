@@ -90,7 +90,8 @@ pub fn parse_ts(s: &[u8]) -> Option<i64> {
     }
     Some(v as i64)
 }
-#[inline(always)]
+#[cfg_attr(not(feature = "prof"), inline(always))]
+#[cfg_attr(feature = "prof", inline(never))]
 pub fn parse_price(s: &[u8]) -> Option<u32> {
     if s.is_empty() {
         return None;
@@ -135,6 +136,7 @@ fn byte(t: u64, i: u32) -> i64 {
 const MT_YEARS: usize = 64;
 static mut MT_BASE: i64 = 2000;
 static mut MONTH_START: [i64; MT_YEARS * 12] = [0; MT_YEARS * 12];
+static mut MONTH_START_MS: [i64; MT_YEARS * 12] = [0; MT_YEARS * 12];
 
 /// Center the month table on the dataset's window (call once, before parsing).
 #[allow(static_mut_refs)]
@@ -144,12 +146,27 @@ pub fn init_month_table(year: i64) {
         for i in 0..MT_YEARS * 12 {
             let y = MT_BASE + (i / 12) as i64;
             MONTH_START[i] = days_from_civil(y, (i % 12) as i64 + 1, 1);
+            MONTH_START_MS[i] = MONTH_START[i] * 86_400_000;
         }
     }
 }
 
 #[inline(always)]
 #[allow(static_mut_refs)]
+fn month_start_ms(y: i64, mo: i64) -> i64 {
+    unsafe {
+        let i = y - MT_BASE;
+        if (i as u64) < MT_YEARS as u64 {
+            *MONTH_START_MS.get_unchecked(i as usize * 12 + mo as usize - 1)
+        } else {
+            days_from_civil(y, mo, 1) * 86_400_000
+        }
+    }
+}
+
+#[inline(always)]
+#[allow(static_mut_refs)]
+#[allow(dead_code)]
 fn month_start(y: i64, mo: i64) -> i64 {
     unsafe {
         let i = y - MT_BASE;
@@ -206,10 +223,25 @@ pub fn parse_dt_fast(s: &[u8]) -> Option<i64> {
             return None;
         }
     }
-    Some((((month_start(y, mo) + d - 1) * 24 + h) * 60 + mi) * 60_000 + se * 1000)
+    Some(month_start_ms(y, mo) + (d - 1) * 86_400_000 + h * 3_600_000 + mi * 60_000 + se * 1000)
 }
 
+/// Eight ASCII digits (already minus '0', most significant in the lowest byte) to their value.
 #[inline(always)]
+fn parse8(chunk: u64) -> u64 {
+    let lower = (chunk & 0x0f00_0f00_0f00_0f00) >> 8;
+    let upper = (chunk & 0x000f_000f_000f_000f) * 10;
+    let chunk = lower + upper;
+    let lower = (chunk & 0x00ff_0000_00ff_0000) >> 16;
+    let upper = (chunk & 0x0000_00ff_0000_00ff) * 100;
+    let chunk = lower + upper;
+    let lower = (chunk & 0x0000_ffff_0000_0000) >> 32;
+    let upper = (chunk & 0x0000_0000_0000_ffff) * 10000;
+    lower + upper
+}
+
+#[cfg_attr(not(feature = "prof"), inline(always))]
+#[cfg_attr(feature = "prof", inline(never))]
 pub fn parse_ts_fast(s: &[u8]) -> Option<i64> {
     let n = s.len();
     if n == 20 {
@@ -238,6 +270,17 @@ fn parse_ts_slow_f3(s: &[u8]) -> Option<i64> {
     let n = s.len();
     if n == 0 {
         return None;
+    }
+    if n <= 16 {
+        // right-align into 16 bytes padded with '0', validate all digits, convert 8 at a time
+        let mut buf = [b'0'; 16];
+        buf[16 - n..].copy_from_slice(s);
+        let a = u64::from_le_bytes(buf[0..8].try_into().unwrap()) ^ 0x3030_3030_3030_3030;
+        let b = u64::from_le_bytes(buf[8..16].try_into().unwrap()) ^ 0x3030_3030_3030_3030;
+        if ((a.wrapping_add(0x7676_7676_7676_7676) | a) | (b.wrapping_add(0x7676_7676_7676_7676) | b)) & 0x8080_8080_8080_8080 != 0 {
+            return None;
+        }
+        return Some((parse8(a) * 100_000_000 + parse8(b)) as i64);
     }
     let mut i = 0;
     while i < n && s[i] == b'0' {

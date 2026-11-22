@@ -29,6 +29,7 @@ pub struct DayAcc {
     pub rev: u64,
 }
 
+#[cfg_attr(feature = "prof", inline(never))]
 pub fn flush_day(w: &mut PersonWork, acc: &DayAcc, name: u64) {
     if acc.sessions == 0 {
         return;
@@ -49,6 +50,7 @@ pub fn flush_day(w: &mut PersonWork, acc: &DayAcc, name: u64) {
 
 /// One person's events (sorted by ts) and clicks (sorted by ts, then click_id).
 /// Event ts is ms since window start; click ts is ms since window start - 7 days.
+#[cfg_attr(feature = "prof", inline(never))]
 pub fn process_person(ev: &[Ev], cs: &[Ck], name_ref: u64, w: &mut PersonWork, ws: i64, day0: i64, ndays: usize, organic: u32) {
     // copy the name once into the thread's sequential buffer; rows refer to it by (offset, len)
     let nm = unpack(name_ref);
@@ -116,12 +118,26 @@ pub fn process_person(ev: &[Ev], cs: &[Ck], name_ref: u64, w: &mut PersonWork, w
         }
         let di = (day - day0) as usize;
         let credited = if hi > lo {
+            // latest click; on a ts tie the byte-wise smallest click_id wins. Clicks are sorted by
+            // ts only, so resolve the (rare) tie here, comparing strings only if campaigns differ.
             let t = cs[hi - 1].ts;
             let mut q = hi - 1;
+            let mut same = true;
             while q > lo && cs[q - 1].ts == t {
                 q -= 1;
+                same &= cs[q].camp == cs[hi - 1].camp;
             }
-            cs[q].camp
+            if same {
+                cs[hi - 1].camp
+            } else {
+                let mut best = q;
+                for j in q + 1..hi {
+                    if unpack(cs[j].cid) < unpack(cs[best].cid) {
+                        best = j;
+                    }
+                }
+                cs[best].camp
+            }
         } else {
             organic
         };
@@ -185,6 +201,7 @@ pub fn write_campaign_daily(path: &Path, rows: &[CRow]) {
 }
 
 /// Sort events by ts: LSD radix (3 x 11 bits) for large slices, comparison sort otherwise.
+#[cfg_attr(feature = "prof", inline(never))]
 pub fn sort_events(ev: &mut [Ev], tmp: &mut Vec<Ev>) {
     let n = ev.len();
     if n < 2048 {

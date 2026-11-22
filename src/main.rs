@@ -402,7 +402,8 @@ pub struct Links {
 }
 impl Links {
     /// Person key and name ref for a linked ID (in user bucket b), or None if the ID is in no link.
-    #[inline(always)]
+#[cfg_attr(not(feature = "prof"), inline(always))]
+#[cfg_attr(feature = "prof", inline(never))]
     fn lookup(&self, b: usize, h: u64) -> Option<(u64, u64)> {
         let off = self.tab_off[b];
         let mask = self.tab_mask[b];
@@ -1139,7 +1140,7 @@ fn main() {
                 }
                 let cs = &mut csorted[cstart[id] as usize..cstart[id + 1] as usize];
                 if cs.len() > 1 {
-                    cs.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| unpack(a.cid).cmp(unpack(b.cid))));
+                    cs.sort_unstable_by_key(|c| c.ts);
                 }
                 process_person(ev, cs, pname[id], &mut w, ws, day0, ndays, organic);
             }
