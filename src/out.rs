@@ -55,7 +55,7 @@ pub fn process_person(ev: &[Ev], cs: &[Ck], name_ref: u64, w: &mut PersonWork, w
     // copy the name once into the thread's sequential buffer; rows refer to it by (offset, len)
     let nm = unpack(name_ref);
     let name = ((w.namebuf.len() as u64) << 16) | nm.len() as u64;
-    w.namebuf.extend_from_slice(nm);
+    pq::push_small(&mut w.namebuf, nm);
     let cbase = ws - WEEK;
     let mut lo = 0usize;
     let mut hi = 0usize;

@@ -391,20 +391,51 @@ struct BitPacker {
 impl BitPacker {
     #[inline(always)]
     fn put(&mut self, v: u32, bw: u32, out: &mut Vec<u8>) {
+        // bw <= 32 and nbits < 32 before the add, so the accumulator never overflows
         self.acc |= (v as u64) << self.nbits;
         self.nbits += bw;
-        while self.nbits >= 8 {
-            out.push(self.acc as u8);
-            self.acc >>= 8;
-            self.nbits -= 8;
+        if self.nbits >= 32 {
+            out.extend_from_slice(&(self.acc as u32).to_le_bytes());
+            self.acc >>= 32;
+            self.nbits -= 32;
         }
     }
     fn flush(&mut self, out: &mut Vec<u8>) {
-        if self.nbits > 0 {
+        while self.nbits > 0 {
             out.push(self.acc as u8);
+            self.acc >>= 8;
+            self.nbits = self.nbits.saturating_sub(8);
         }
         self.acc = 0;
         self.nbits = 0;
+    }
+}
+
+/// Append s; short strings (the common case) are copied with overlapping word moves, no memcpy call.
+#[inline(always)]
+pub fn push_small(out: &mut Vec<u8>, s: &[u8]) {
+    let n = s.len();
+    if n > 16 {
+        out.extend_from_slice(s);
+        return;
+    }
+    out.reserve(16);
+    let l = out.len();
+    unsafe {
+        let d = out.as_mut_ptr().add(l);
+        let p = s.as_ptr();
+        if n >= 8 {
+            (d as *mut u64).write_unaligned((p as *const u64).read_unaligned());
+            (d.add(n - 8) as *mut u64).write_unaligned((p.add(n - 8) as *const u64).read_unaligned());
+        } else if n >= 4 {
+            (d as *mut u32).write_unaligned((p as *const u32).read_unaligned());
+            (d.add(n - 4) as *mut u32).write_unaligned((p.add(n - 4) as *const u32).read_unaligned());
+        } else {
+            for j in 0..n {
+                *d.add(j) = *p.add(j);
+            }
+        }
+        out.set_len(l + n);
     }
 }
 
@@ -442,7 +473,7 @@ impl StreamWriter {
         for i in 0..n {
             let s = get(i);
             self.stage.extend_from_slice(&(s.len() as u32).to_le_bytes());
-            self.stage.extend_from_slice(s);
+            push_small(&mut self.stage, s);
             if self.stage.len() >= 60_000 {
                 self.drain_stage()?;
             }
