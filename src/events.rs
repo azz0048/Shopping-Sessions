@@ -2456,6 +2456,8 @@ const SLAB_ROWS: usize = crate::env_u32(option_env!("XL_SLABROWS"), 13) as usize
 const CXR_DIV: usize = crate::env_u32(option_env!("XL_CXRDIV"), 64) as usize;
 
 pub fn stage3(g: &mut G) {
+    crate::precheck::run(g);
+    lap("precheck");
     g.next.store(0, Ordering::Relaxed);
     {
         let gr: &G = g;

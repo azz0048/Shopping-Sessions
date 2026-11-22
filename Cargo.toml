@@ -8,6 +8,10 @@ publish = false
 name = "pipeline"
 path = "src/main.rs"
 
+[[bin]]
+name = "pipeline-portable"
+path = "src/portable.rs"
+
 [features]
 stats = []
 knobs = []
