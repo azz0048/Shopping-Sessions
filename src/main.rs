@@ -880,9 +880,7 @@ fn main() {
     lap("setup");
 
     let block: usize = std::env::var("SS_BLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(8192);
-    if std::env::var_os("SS_BENCHFILE").is_none() {
-        init_arena(1 << 30, block);
-    }
+    init_arena(1 << 30, block);
 
     // L: links
     let mut lchunks = Vec::new();
@@ -910,7 +908,6 @@ fn main() {
         // single-threaded parse benchmark on one warm file (no output)
         let d = map_file(std::path::Path::new(&bf));
         let d: &'static [u8] = Box::leak(d.to_vec().into_boxed_slice());
-        init_arena(1 << 30, 32768);
         let c = Chunk { data: d, start: 0, end: d.len(), kind: 0 };
         let mut best = f64::MAX;
         for it in 0..15 {
@@ -1049,7 +1046,8 @@ fn main() {
             }
             let b = order[i];
             let mut nm: Vec<(u64, u64)> = Vec::new();
-            seen.reset(64);
+            let nb: usize = pouts.iter().map(|po| po.recs.len(b)).sum();
+            seen.reset(nb / 8 + 64);
             for po in pouts.iter() {
                 po.recs.for_slices(b, |x| {
                     for r in x {
@@ -1156,7 +1154,7 @@ fn main() {
                 continue;
             }
             // group by person: hash -> local id, counting sort, then sort each person's events by ts
-            pmap.reset(n / 16);
+            pmap.reset(n / 6);
             pcount.clear();
             pperson.clear();
             ra.clear();

@@ -152,13 +152,13 @@ pub fn split_at<const N: usize>(data: &'static [u8], p: usize, out: &mut [&'stat
                 };
                 let flen = b - a;
                 let first = unsafe { *base.add(a) };
-                let last = unsafe { *base.add(b - 1 + (flen == 0) as usize) };
+                let last = unsafe { *base.add(b + (flen == 0) as usize - 1) };
                 let qf = first == b'"';
                 let ql = last == b'"';
                 valid &= (qf == ql) & !(qf & (flen < 2));
                 let qd = qf as usize;
                 nq += qf as u32;
-                out[k] = unsafe { std::slice::from_raw_parts(base.add(a + qd), flen.wrapping_sub(2 * qd)) };
+                out[k] = unsafe { std::slice::from_raw_parts(base.add(a + qd), flen.saturating_sub(2 * qd)) };
                 a = b + 1;
             }
             return (next, valid & (nquotes == 2 * nq));
